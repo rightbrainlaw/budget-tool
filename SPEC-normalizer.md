@@ -80,6 +80,31 @@ There are at least three different formats in one file. Branch on `Type`.
 Unknown `Type` values must not silently fall through. Log them and pass
 the collapsed-whitespace description through as `merchant`.
 
+## Merchant cleaning
+
+Two cleanup steps sit on top of the per-`Type` parsers above. Resolution
+order for the final `merchant` is: **alias override first, then the parser
+output with the order-id split applied.** The parser still runs in every
+case, because it is the only source of the transaction `date`.
+
+1. **Order-id split (`MERCHANT*ORDERID`).** Payment aggregators append a
+   per-transaction order id after a `*`, e.g. `Audible*2M0FW7SD3`,
+   and similar forms from Square, PayPal, and Stripe. Split on the first
+   `*` and keep the left side. Everything after the `*` (order id plus any
+   trailing location/routing junk) is dropped. A description with no `*` is
+   left unchanged.
+
+2. **Alias file (`merchant_aliases.csv`).** A two-column
+   `raw,display` map, consulted **before** the parser's cleaning is trusted:
+   if any `raw` needle appears (case-insensitive, whitespace-collapsed) in
+   the original description, its `display` value becomes the merchant and
+   wins over the parser. This is the maintenance escape hatch — a future bad
+   name is fixed by **adding a row to the CSV, not editing regex**. A single
+   row (`Audible` -> `Audible`) covers every Audible transaction regardless
+   of its varying order id, location, or date. Seeded with the Audible row.
+   The file is config, not data, so it is committed via a `.gitignore`
+   exception even though `*.csv` is ignored.
+
 ## Dedup
 
 `txn_id` is a content hash, not a bank-issued ID, because Chase checking

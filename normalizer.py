@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import logging
+import os
 import re
 from datetime import date
 
@@ -44,6 +45,10 @@ OUTPUT_COLUMNS = [
     "pending",
     "source_file",
 ]
+
+# Manual raw-string -> display-name overrides. Editing this CSV (add a row) is
+# how bad merchant names get fixed going forward, instead of editing regex.
+DEFAULT_ALIAS_FILE = "merchant_aliases.csv"
 
 
 # --------------------------------------------------------------------------- #
@@ -194,15 +199,74 @@ _PARSERS = {
 }
 
 
-def parse_description(txn_type: str, desc: str, posted: date) -> tuple[str, date]:
-    """Route to the right parser by Type; never let an unknown Type fall through."""
+def _strip_order_id(merchant: str) -> str:
+    """MERCHANT*ORDERID -> MERCHANT: split on the first '*' and keep the left.
+
+    Aggregators (Audible, Square, PayPal, Stripe) append a per-transaction order
+    id after a '*', e.g. 'Audible*2M0FW7SD3'. Everything from the '*' onward is
+    noise for our purposes, so drop it. No '*' -> string returned unchanged.
+    """
+    return merchant.split("*", 1)[0].strip()
+
+
+def load_aliases(path: str = DEFAULT_ALIAS_FILE) -> list[tuple[str, str]]:
+    """Load raw->display merchant aliases as (needle_lower, display) pairs.
+
+    A missing file simply means no aliases. Blank rows are skipped. Order is
+    preserved so the first matching row wins in _match_alias().
+    """
+    if not os.path.exists(path):
+        return []
+    frame = pd.read_csv(path, dtype=str).fillna("")
+    pairs: list[tuple[str, str]] = []
+    for _, row in frame.iterrows():
+        needle = _collapse(row.get("raw", "")).lower()
+        display = _collapse(row.get("display", ""))
+        if needle and display:
+            pairs.append((needle, display))
+    return pairs
+
+
+def _match_alias(desc: str, aliases: list[tuple[str, str]]) -> str | None:
+    """Return the display name whose raw needle is a substring of desc, else None.
+
+    Match is case-insensitive on the whitespace-collapsed raw description, so a
+    single alias row ('Audible' -> 'Audible') covers every Audible transaction
+    regardless of its varying order id, location suffix, or date.
+    """
+    hay = _collapse(desc).lower()
+    for needle, display in aliases:
+        if needle in hay:
+            return display
+    return None
+
+
+def parse_description(
+    txn_type: str, desc: str, posted: date, aliases: list[tuple[str, str]] | None = None
+) -> tuple[str, date]:
+    """Resolve (merchant, transaction_date) for one row.
+
+    Merchant resolution order:
+      1. Alias override -- consulted first; a raw->display row in
+         merchant_aliases.csv wins outright over any regex cleaning.
+      2. Type parser -- branch on Type to extract the raw merchant, then strip a
+         trailing '*ORDERID'. Unknown Types are logged, never silently dropped.
+
+    The Type parser always runs regardless of alias, because it is also the only
+    source of the transaction date (e.g. the trailing MM/DD on DEBIT_CARD rows).
+    """
     parser = _PARSERS.get(txn_type)
     if parser is not None:
-        return parser(desc, posted)
-    # Unknown Type: log it (so new formats surface) and pass the cleaned
-    # description straight through as the merchant, date falls back to posted.
-    log.warning("Unknown Type %r; passing description through: %r", txn_type, desc)
-    return _collapse(desc), posted
+        parsed_merchant, txn_date = parser(desc, posted)
+    else:
+        # Unknown Type: log it (so new formats surface) and pass the cleaned
+        # description straight through as the merchant, date falls back to posted.
+        log.warning("Unknown Type %r; passing description through: %r", txn_type, desc)
+        parsed_merchant, txn_date = _collapse(desc), posted
+
+    alias = _match_alias(desc, aliases or [])
+    merchant = alias if alias is not None else _strip_order_id(parsed_merchant)
+    return merchant, txn_date
 
 
 # --------------------------------------------------------------------------- #
@@ -224,7 +288,9 @@ def make_txn_id(txn_date: date, amount: float, merchant: str, account: str) -> s
 # --------------------------------------------------------------------------- #
 # 5. Normalize one file
 # --------------------------------------------------------------------------- #
-def normalize_file(path: str, account: str) -> pd.DataFrame:
+def normalize_file(
+    path: str, account: str, alias_file: str = DEFAULT_ALIAS_FILE
+) -> pd.DataFrame:
     """Read one Chase export and return the fixed output schema.
 
     Order matters: we validate the balance chain while Balance is still in
@@ -232,6 +298,7 @@ def normalize_file(path: str, account: str) -> pd.DataFrame:
     original file order and breaks the moment rows are sorted or deduped.
     """
     source_file = path.rsplit("/", 1)[-1]
+    aliases = load_aliases(alias_file)
     filtered = filter_junk(read_chase_csv(path))
 
     # Assertion 1: something survived the filter.
@@ -253,7 +320,7 @@ def normalize_file(path: str, account: str) -> pd.DataFrame:
     merchants: list[str] = []
     txn_dates: list[date] = []
     for typ, desc, pdt in zip(filtered["Type"], filtered["Description"], posted_date):
-        merch, tdate = parse_description(str(typ), str(desc), pdt)
+        merch, tdate = parse_description(str(typ), str(desc), pdt, aliases)
         merchants.append(merch)
         txn_dates.append(tdate)
 
