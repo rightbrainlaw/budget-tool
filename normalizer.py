@@ -1,23 +1,19 @@
-"""Chase checking CSV -> one consistent internal transaction table.
+"""Chase checking CSV -> one consistent internal ledger table.
 
-Pass one. Implements SPEC-normalizer.md and nothing else: no UI, no auth, no
-hosting. Everything here is about turning a raw Chase export into the fixed
-output schema, validating it, and providing the dedup / transfer helpers the
-spec calls for.
+Pass one (ledger layer). Implements SPEC-normalizer.md and nothing else: no UI,
+no auth, no hosting. It turns a raw Chase export into the fixed ledger schema --
+bank facts only, no interpretation. Meaning (merchant, category) is the
+enrichment layer's job, joined back later by txn_id.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
-import logging
-import os
 import re
 from datetime import date
 
 import pandas as pd
-
-log = logging.getLogger("normalizer")
 
 # The exact header Chase writes, used to sanity-check inputs before we trust
 # any column by name.
@@ -31,24 +27,20 @@ CHASE_HEADER = [
     "Check or Slip #",
 ]
 
-# The fixed output schema, in order. normalize_file() guarantees exactly these
-# columns and nothing else. (Balance is deliberately NOT here -- see below.)
+# The fixed ledger schema, in order. normalize_file() guarantees exactly these
+# columns and nothing else -- bank facts only. merchant/category are NOT here;
+# they are enrichment, joined back by txn_id. (Balance is dropped too -- see
+# below.)
 OUTPUT_COLUMNS = [
     "txn_id",
     "date",
     "posted_date",
     "amount",
-    "merchant",
     "description",
     "account",
-    "category",
     "pending",
     "source_file",
 ]
-
-# Manual raw-string -> display-name overrides. Editing this CSV (add a row) is
-# how bad merchant names get fixed going forward, instead of editing regex.
-DEFAULT_ALIAS_FILE = "merchant_aliases.csv"
 
 
 # --------------------------------------------------------------------------- #
@@ -95,14 +87,12 @@ def filter_junk(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------- #
-# 3. Description parsing -- branch on Type
+# 3. Transaction date
 # --------------------------------------------------------------------------- #
-_WS = re.compile(r"\s+")
-
-
-def _collapse(s: str) -> str:
-    """Collapse any run of whitespace to a single space and trim the ends."""
-    return _WS.sub(" ", str(s)).strip()
+# The only reason the ledger layer reads the description at all is to recover the
+# real transaction date, which can differ from the posting date. We do NOT parse
+# a merchant here -- that is the enrichment layer's job.
+_TRAILING_DATE = re.compile(r"(\d{1,2})/(\d{1,2})\s*$")
 
 
 def _infer_txn_date(mm: int, dd: int, posted: date) -> date:
@@ -127,178 +117,49 @@ def _infer_txn_date(mm: int, dd: int, posted: date) -> date:
     return candidate
 
 
-def _parse_debit_card(desc: str, posted: date) -> tuple[str, date]:
-    """DEBIT_CARD: merchant at the front, real MM/DD transaction date at end.
+def extract_txn_date(txn_type: str, desc: str, posted: date) -> date:
+    """Recover the transaction date.
 
-    Example:
-      'Whole Foods RSQ 10103 866-216-1072 DE          07/27'
+    Only DEBIT_CARD rows embed one (a trailing MM/DD, e.g. the '07/27' in
+    'Whole Foods RSQ 10103 866-216-1072 DE  07/27'). Every other Type has no
+    embedded date, so it falls back to posted_date.
     """
-    trailing = re.search(r"(\d{1,2})/(\d{1,2})\s*$", desc)
-    if trailing:
-        txn_date = _infer_txn_date(int(trailing.group(1)), int(trailing.group(2)), posted)
-        head = desc[: trailing.start()]
-    else:
-        # No trailing date on this card row; fall back to posted_date.
-        txn_date = posted
-        head = desc
-
-    # Merchant is the leading run of word-ish tokens. Stop at the first token
-    # that is a store number / phone number (i.e. has no letters), which is
-    # where the trailing location/routing junk begins.
-    merchant_tokens: list[str] = []
-    for tok in _collapse(head).split():
-        if re.search(r"[A-Za-z]", tok):
-            merchant_tokens.append(tok)
-        else:
-            break
-    merchant = " ".join(merchant_tokens) or _collapse(head)
-    return merchant, txn_date
-
-
-def _parse_misc_debit(desc: str, posted: date) -> tuple[str, date]:
-    """MISC_DEBIT: fixed-width, padded POS line. No transaction date available.
-
-    Example:
-      'POS DEBIT                SAFEWAY #1551            SEATTLE       WA          2645'
-    -> strip 'POS DEBIT', collapse whitespace, drop trailing 4-digit terminal
-       code, then peel the trailing state and city.
-    """
-    body = _collapse(re.sub(r"^\s*POS DEBIT", "", desc, count=1))
-    tokens = body.split()
-
-    if tokens and re.fullmatch(r"\d{4}", tokens[-1]):
-        tokens.pop()                                   # terminal code
-    if tokens and re.fullmatch(r"[A-Z]{2}", tokens[-1]):
-        tokens.pop()                                   # 2-letter state
-        if tokens:
-            tokens.pop()  # city. NOTE: single token only -- 'SAN FRANCISCO'
-                          # would leave 'SAN' behind. Good enough for pass one.
-    merchant = " ".join(tokens) or body
-    return merchant, posted  # date falls back to posted_date
-
-
-def _parse_ach_debit(desc: str, posted: date) -> tuple[str, date]:
-    """ACH_DEBIT: key-value soup; the only useful field is ORIG CO NAME.
-
-    Example:
-      'ORIG CO NAME:SEATTLEUTILTIES  CO ENTRY DESCR:WEB_PAY  SEC:WEB IND ID:...'
-    The value ends at the next run of 2+ spaces (the padding before the next
-    key) or at end of string. We do NOT correct vendor typos -- 'SEATTLEUTILTIES'
-    is passed through exactly as the bank wrote it.
-    """
-    m = re.search(r"ORIG CO NAME:\s*(.+?)(?:\s{2,}|$)", desc)
-    merchant = _collapse(m.group(1)) if m else _collapse(desc)
-    return merchant, posted  # date falls back to posted_date
-
-
-# Dispatch table. Every branch returns (merchant, transaction_date).
-_PARSERS = {
-    "DEBIT_CARD": _parse_debit_card,
-    "MISC_DEBIT": _parse_misc_debit,
-    "ACH_DEBIT": _parse_ach_debit,
-}
-
-
-def _strip_order_id(merchant: str) -> str:
-    """MERCHANT*ORDERID -> MERCHANT: split on the first '*' and keep the left.
-
-    Aggregators (Audible, Square, PayPal, Stripe) append a per-transaction order
-    id after a '*', e.g. 'Audible*2M0FW7SD3'. Everything from the '*' onward is
-    noise for our purposes, so drop it. No '*' -> string returned unchanged.
-    """
-    return merchant.split("*", 1)[0].strip()
-
-
-def load_aliases(path: str = DEFAULT_ALIAS_FILE) -> list[tuple[str, str]]:
-    """Load raw->display merchant aliases as (needle_lower, display) pairs.
-
-    A missing file simply means no aliases. Blank rows are skipped. Order is
-    preserved so the first matching row wins in _match_alias().
-    """
-    if not os.path.exists(path):
-        return []
-    frame = pd.read_csv(path, dtype=str).fillna("")
-    pairs: list[tuple[str, str]] = []
-    for _, row in frame.iterrows():
-        needle = _collapse(row.get("raw", "")).lower()
-        display = _collapse(row.get("display", ""))
-        if needle and display:
-            pairs.append((needle, display))
-    return pairs
-
-
-def _match_alias(desc: str, aliases: list[tuple[str, str]]) -> str | None:
-    """Return the display name whose raw needle is a substring of desc, else None.
-
-    Match is case-insensitive on the whitespace-collapsed raw description, so a
-    single alias row ('Audible' -> 'Audible') covers every Audible transaction
-    regardless of its varying order id, location suffix, or date.
-    """
-    hay = _collapse(desc).lower()
-    for needle, display in aliases:
-        if needle in hay:
-            return display
-    return None
-
-
-def parse_description(
-    txn_type: str, desc: str, posted: date, aliases: list[tuple[str, str]] | None = None
-) -> tuple[str, date]:
-    """Resolve (merchant, transaction_date) for one row.
-
-    Merchant resolution order:
-      1. Alias override -- consulted first; a raw->display row in
-         merchant_aliases.csv wins outright over any regex cleaning.
-      2. Type parser -- branch on Type to extract the raw merchant, then strip a
-         trailing '*ORDERID'. Unknown Types are logged, never silently dropped.
-
-    The Type parser always runs regardless of alias, because it is also the only
-    source of the transaction date (e.g. the trailing MM/DD on DEBIT_CARD rows).
-    """
-    parser = _PARSERS.get(txn_type)
-    if parser is not None:
-        parsed_merchant, txn_date = parser(desc, posted)
-    else:
-        # Unknown Type: log it (so new formats surface) and pass the cleaned
-        # description straight through as the merchant, date falls back to posted.
-        log.warning("Unknown Type %r; passing description through: %r", txn_type, desc)
-        parsed_merchant, txn_date = _collapse(desc), posted
-
-    alias = _match_alias(desc, aliases or [])
-    merchant = alias if alias is not None else _strip_order_id(parsed_merchant)
-    return merchant, txn_date
+    if txn_type == "DEBIT_CARD":
+        m = _TRAILING_DATE.search(desc)
+        if m:
+            return _infer_txn_date(int(m.group(1)), int(m.group(2)), posted)
+    return posted
 
 
 # --------------------------------------------------------------------------- #
 # 4. txn_id
 # --------------------------------------------------------------------------- #
-def make_txn_id(txn_date: date, amount: float, merchant: str, account: str) -> str:
+def make_txn_id(txn_date: date, amount: float, description: str, account: str) -> str:
     """Content hash used as the primary key.
 
-    DECISION (not an accident): Chase checking exports carry no stable
-    bank-issued id, so txn_id is sha1(date|amount|merchant|account). The known
-    tradeoff is that two genuinely separate but identical purchases on the same
-    day, same merchant, same account collide and one is lost on dedup. We
-    accept that in exchange for safe re-uploads of overlapping date ranges.
+    Computed from BANK FACTS ONLY -- sha1(date|amount|description|account) --
+    never from anything the user edits, so enrichment keyed on txn_id survives
+    edits and re-imports. Chase checking exports carry no stable bank-issued id.
+
+    DECISION (not an accident): two byte-identical transactions (same day,
+    amount, description, account) collide and one is lost on dedup. Accepted in
+    exchange for safe, idempotent re-uploads of overlapping date ranges.
     """
-    key = f"{txn_date.isoformat()}|{amount:.2f}|{merchant}|{account}"
+    key = f"{txn_date.isoformat()}|{amount:.2f}|{description}|{account}"
     return hashlib.sha1(key.encode("utf-8")).hexdigest()
 
 
 # --------------------------------------------------------------------------- #
 # 5. Normalize one file
 # --------------------------------------------------------------------------- #
-def normalize_file(
-    path: str, account: str, alias_file: str = DEFAULT_ALIAS_FILE
-) -> pd.DataFrame:
-    """Read one Chase export and return the fixed output schema.
+def normalize_file(path: str, account: str) -> pd.DataFrame:
+    """Read one Chase export and return the fixed ledger schema.
 
     Order matters: we validate the balance chain while Balance is still in
     hand, then drop it, because a running balance is only meaningful in
     original file order and breaks the moment rows are sorted or deduped.
     """
     source_file = path.rsplit("/", 1)[-1]
-    aliases = load_aliases(alias_file)
     filtered = filter_junk(read_chase_csv(path))
 
     # Assertion 1: something survived the filter.
@@ -316,30 +177,27 @@ def normalize_file(
     # Balance below.
     _check_balance_chain(filtered.loc[~pending], amount.loc[~pending])
 
-    # Parse each row's description by Type into (merchant, transaction date).
-    merchants: list[str] = []
-    txn_dates: list[date] = []
-    for typ, desc, pdt in zip(filtered["Type"], filtered["Description"], posted_date):
-        merch, tdate = parse_description(str(typ), str(desc), pdt, aliases)
-        merchants.append(merch)
-        txn_dates.append(tdate)
+    # The only thing we read from the description is the transaction date.
+    descriptions = filtered["Description"].astype(str)
+    txn_dates = [
+        extract_txn_date(str(typ), desc, pdt)
+        for typ, desc, pdt in zip(filtered["Type"], descriptions, posted_date)
+    ]
 
     out = pd.DataFrame(
         {
             "date": txn_dates,
             "posted_date": list(posted_date),
             "amount": amount.to_numpy(),
-            "merchant": merchants,
-            "description": filtered["Description"].astype(str).to_numpy(),
+            "description": descriptions.to_numpy(),
             "account": account,
-            "category": None,               # nullable in pass one
             "pending": pending,
             "source_file": source_file,
         }
     )
     out["txn_id"] = [
-        make_txn_id(d, a, m, account)
-        for d, a, m in zip(out["date"], out["amount"], out["merchant"])
+        make_txn_id(d, a, desc, account)
+        for d, a, desc in zip(out["date"], out["amount"], out["description"])
     ]
     out = out[OUTPUT_COLUMNS]  # enforce column order / membership
 
@@ -349,8 +207,8 @@ def normalize_file(
     # Assertion 2: no null date or amount survived.
     assert out["date"].notna().all(), "Null date in output"
     assert out["amount"].notna().all(), "Null amount in output"
-    # Assertion 4: every row has a non-empty merchant.
-    assert (out["merchant"].str.len() > 0).all(), "Empty merchant in output"
+    # Assertion 4: every row has a non-empty description.
+    assert (out["description"].str.len() > 0).all(), "Empty description in output"
 
     return out
 
@@ -427,7 +285,6 @@ def main() -> None:
     parser.add_argument("--account", required=True, help="account name this file came from")
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     df = normalize_file(args.csv, args.account)
     print(df.to_string(index=False))
     print(f"\n{len(df)} transactions | spend total (excl. transfers): {spend_total(df):.2f}")

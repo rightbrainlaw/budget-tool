@@ -13,6 +13,3 @@ __pycache__/
 # Exception: the fake test fixture is safe to commit (invented data, no real
 # financial info). Real exports still match *.csv above and stay ignored.
 !tests/sample_transactions.csv
-
-# Exception: merchant_aliases.csv is config (raw->display name map), not data.
-!merchant_aliases.csv

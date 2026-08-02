@@ -182,7 +182,7 @@ Reports = Transactions ⋈ Enrichment, gated on category completeness
 
 ## Repo hygiene
 
-`.gitignore` contains `*.csv`, `data/`, and `.streamlit/secrets.toml`. Two
-config CSVs are committed via explicit `!` exceptions: the invented test
-fixture (`tests/sample_transactions.csv`) and — pending the pass-two rework —
-`merchant_aliases.csv`, which the enrichment layer will supersede.
+`.gitignore` contains `*.csv`, `data/`, and `.streamlit/secrets.toml`. The
+invented test fixture (`tests/sample_transactions.csv`) is committed via an
+explicit `!` exception so real exports stay ignored while the fixture is
+tracked.
