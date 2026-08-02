@@ -1,7 +1,24 @@
-# Transaction Normalizer Spec (pass one)
+# Transaction Normalizer Spec (pass one — ledger layer)
 
-Purpose: turn any Chase CSV export into one consistent internal table.
+Purpose: turn any Chase CSV export into one consistent **ledger** — the plain
+facts the bank gives us, and nothing interpretive. Meaning (which merchant a
+row represents, what budget category it belongs to) is deliberately **not**
+this layer's job; it belongs to the enrichment layer described at the end.
 Nothing in this pass touches UI, auth, or hosting.
+
+## Two layers, and why they are separate
+
+- **Ledger layer (this spec).** Derived purely from the bank file: date,
+  amount, raw description, account, etc. Immutable — re-importing the same
+  transaction always reproduces the same row, including the same `txn_id`.
+  The normalizer never guesses at what a description "means."
+- **Enrichment layer (pass two, sketched below).** User-assigned `merchant`
+  and `category`, stored separately and joined back to the ledger by `txn_id`.
+
+The split exists so that regex on messy bank memos never becomes load-bearing.
+Earlier drafts of this spec tried to parse a clean `merchant` out of the
+description by branching on `Type`; that was the most fragile part of the
+pipeline and is removed. Merchant is now curated data, not a parse result.
 
 ## Input format observed (Chase checking export)
 
@@ -17,7 +34,10 @@ Details,Posting Date,Description,Amount,Type,Balance,Check or Slip #
   `format="%m/%d/%y"`. Do not let pandas infer.
 - `Amount`: already signed, negative for money out. Do not derive sign
   from `Details`.
-- `Type`: `DEBIT_CARD`, `MISC_DEBIT`, `ACH_DEBIT`, and others not yet seen.
+- `Type`: `DEBIT_CARD`, `MISC_DEBIT`, `ACH_DEBIT`, `ACH_CREDIT`, `ACCT_XFER`,
+  and others not yet seen. Note that `Type` does **not** map cleanly to
+  description format (e.g. some `MISC_DEBIT` rows are ACH-style, not POS
+  lines), which is one more reason we no longer parse meaning out of it.
 - `Balance`: running balance, present only on posted rows. A literal
   single space `" "` on pending rows, which means pandas reads the whole
   column as `str`, not `float`.
@@ -34,87 +54,60 @@ Rule: **drop any row where `Posting Date` or `Amount` is null.** That
 removes both classes. Never trust `len(df)` as a transaction count
 before this filter runs.
 
-## Output schema
+## Output schema (ledger only)
 
-| column       | type    | notes                                                  |
-|--------------|---------|--------------------------------------------------------|
-| `txn_id`     | str     | sha1 of `date` + `amount` + `merchant` + `account`      |
+| column       | type    | notes                                                   |
+|--------------|---------|---------------------------------------------------------|
+| `txn_id`     | str     | sha1 of `date` + `amount` + `description` + `account`   |
 | `date`       | date    | transaction date, not posting date (see below)          |
 | `posted_date`| date    | from `Posting Date`                                     |
 | `amount`     | float   | signed, negative = money out                            |
-| `merchant`   | str     | cleaned, human readable                                 |
-| `description`| str     | original string, untouched, kept for debugging          |
+| `description`| str     | original bank string, untouched                         |
 | `account`    | str     | which account the file came from                        |
-| `category`   | str     | nullable in pass one                                    |
 | `pending`    | bool    | true when `Balance` was blank                           |
 | `source_file`| str     | filename of the export                                  |
 
-Deliberately **not** stored: `Balance`. A running balance is only
-meaningful in original file order, so it breaks the moment rows are
-sorted, merged, or deduped. Use it during parsing, then drop it.
+Deliberately **not** in this layer:
 
-## Description parsing
+- `merchant` and `category` — enrichment, assigned by the user later and
+  joined by `txn_id`. See the enrichment section.
+- `Balance` — a running balance is only meaningful in original file order, so
+  it breaks the moment rows are sorted, merged, or deduped. Use it during
+  validation (below), then drop it.
 
-There are at least three different formats in one file. Branch on `Type`.
+## Transaction date
 
-1. **`DEBIT_CARD`** (posted card purchases)
-   `Whole Foods RSQ 10103 866-216-1072 DE          07/27`
-   Merchant name at the front, and the **real transaction date** at the
-   end, which differs from `Posting Date`. Extract that trailing `MM/DD`
-   into `date` and infer the year from `posted_date` (watch the December
-   to January rollover).
+The only reason the ledger layer reads the description at all is to recover the
+real transaction date, which can differ from the posting date.
 
-2. **`MISC_DEBIT`** (pending point of sale)
-   `POS DEBIT                SAFEWAY #1551            SEATTLE       WA                    2645`
-   Fixed-width padded. Strip the `POS DEBIT` prefix, collapse runs of
-   whitespace, drop the trailing 4-digit terminal code, then peel off
-   the trailing state and city. No transaction date available, so
-   `date` falls back to `posted_date`.
+- **`DEBIT_CARD`** rows carry a trailing `MM/DD`, e.g.
+  `Whole Foods RSQ 10103 866-216-1072 DE          07/27`. Extract it into
+  `date` and infer the year from `posted_date`, handling the December→January
+  rollover: a purchase posts on or a few days after it occurs, so if using the
+  posting year would place the transaction *after* it posted, step the year
+  back by one.
+- **All other `Type`s** have no embedded transaction date, so `date` falls
+  back to `posted_date`.
 
-3. **`ACH_DEBIT`** (bill pay and direct debits)
-   `ORIG CO NAME:SEATTLEUTILTIES  CO ENTRY DESCR:WEB_PAY    SEC:WEB IND ID:... ORIG ID:...`
-   Key-value soup. The only useful field is `ORIG CO NAME`. Extract it
-   and discard the rest. Note the vendor's own typo in the sample, so do
-   not assume company names are spelled correctly.
+No merchant extraction, no `Type`-branching beyond "is there a trailing date."
+The raw `description` is stored exactly as the bank wrote it, typos and all.
 
-Unknown `Type` values must not silently fall through. Log them and pass
-the collapsed-whitespace description through as `merchant`.
-
-## Merchant cleaning
-
-Two cleanup steps sit on top of the per-`Type` parsers above. Resolution
-order for the final `merchant` is: **alias override first, then the parser
-output with the order-id split applied.** The parser still runs in every
-case, because it is the only source of the transaction `date`.
-
-1. **Order-id split (`MERCHANT*ORDERID`).** Payment aggregators append a
-   per-transaction order id after a `*`, e.g. `Audible*2M0FW7SD3`,
-   and similar forms from Square, PayPal, and Stripe. Split on the first
-   `*` and keep the left side. Everything after the `*` (order id plus any
-   trailing location/routing junk) is dropped. A description with no `*` is
-   left unchanged.
-
-2. **Alias file (`merchant_aliases.csv`).** A two-column
-   `raw,display` map, consulted **before** the parser's cleaning is trusted:
-   if any `raw` needle appears (case-insensitive, whitespace-collapsed) in
-   the original description, its `display` value becomes the merchant and
-   wins over the parser. This is the maintenance escape hatch — a future bad
-   name is fixed by **adding a row to the CSV, not editing regex**. A single
-   row (`Audible` -> `Audible`) covers every Audible transaction regardless
-   of its varying order id, location, or date. Seeded with the Audible row.
-   The file is config, not data, so it is committed via a `.gitignore`
-   exception even though `*.csv` is ignored.
-
-## Dedup
+## txn_id and dedup
 
 `txn_id` is a content hash, not a bank-issued ID, because Chase checking
-exports do not provide a stable one. Two genuinely separate identical
-purchases on the same day at the same merchant will collide and one will
-be lost. That is the accepted tradeoff. Make it a documented decision in
-code comments, not an accident.
+exports do not provide a stable one. It is computed from **bank facts only**
+(`date` + `amount` + `description` + `account`) — never from anything a user
+edits. Two consequences make this the linchpin of the whole design:
 
-On import, upsert on `txn_id` so overlapping date ranges are safe to
-re-upload.
+1. Assigning or changing a `merchant`/`category` never changes `txn_id`, so
+   enrichment stays attached to its row.
+2. Re-importing an overlapping date range reproduces the identical `txn_id`,
+   so **enrichment survives re-imports for free.**
+
+Tradeoff, to be documented in code, not discovered by accident: two genuinely
+separate but byte-identical transactions (same day, amount, description,
+account) collide and one is lost on dedup. Accepted in exchange for safe,
+idempotent re-uploads. On import, upsert on `txn_id`.
 
 ## Transfers
 
@@ -122,7 +115,8 @@ Money moving between accounts appears twice, once negative and once
 positive, and will inflate any spending total. Detection heuristic:
 equal absolute amounts, opposite signs, different `account`, dates
 within a few days. Flag rather than delete, and exclude flagged rows
-from spend totals.
+from spend totals. (A single-file import cannot pair the two legs; this
+runs on the combined multi-account ledger.)
 
 ## Validation assertions
 
@@ -134,18 +128,61 @@ Run these on every import and fail loudly:
    `balance[i] == balance[i+1] + amount[i]`. Verified against the sample.
    This is the strongest integrity check available, so use it while
    `Balance` is still in hand.
-4. Every output row has a non-empty `merchant`.
+4. Every output row has a non-empty `description`.
+
+## Enrichment layer (pass two — design, not yet built)
+
+Meaning is added on top of the immutable ledger, keyed by `txn_id`. This is how
+the mainstream apps work and how Dan has built it before in Sheets.
+
+- **`merchant` is a saveable entity, not a parsed string.** A "Merchants" list
+  (`merchant_id`, `name`, optional `default_category`) backs a dropdown. You
+  look at a transaction, decide it's Amazon, pick or add Amazon, and save. This
+  preserves "you spent $200 at Amazon this month" without any name being
+  auto-identified from the memo.
+- **`category` is the required reporting field; `merchant` is optional.** Rows
+  with no merchant still report by category.
+- **Remembered mappings (optional, additive).** Categorizing one transaction
+  can create a `description-signature → merchant/category` mapping so future
+  matching rows auto-fill. This is memory generated *from your choices*, not
+  hand-authored regex. With it off, you just pick manually more often. (This
+  supersedes the old `merchant_aliases.csv` idea, which was authored regex
+  aimed at a cosmetic name.)
+- **Completeness gate (soft).** Before running reports for a period, surface
+  any transactions still missing a category ("12 need review") and warn, rather
+  than hard-blocking access to your own data.
+
+Sketch:
+
+```
+Transactions (ledger, immutable)        Enrichment (user-assigned)
+  txn_id  ← PK, hash of bank facts  ──┐   txn_id       ← FK
+  date, posted_date, amount           └─▶ merchant_id  ← FK, nullable
+  description (raw)                        category     ← required for reports
+  account, pending, source_file           reviewed?
+
+Merchants (saveable)          Remembered mappings (optional, auto-grown)
+  merchant_id, name             match_pattern → merchant_id / category
+  default_category?
+
+Reports = Transactions ⋈ Enrichment, gated on category completeness
+```
 
 ## Known gaps to fill before pass two
 
-- No `CREDIT` rows in the sample, so deposit and refund handling is
-  untested. Get an export containing a paycheck or a Zelle receipt.
+- `CREDIT` rows (deposits, refunds, payroll) now appear in real exports and
+  arrive as `Type=ACH_CREDIT` and similar. They parse into the ledger fine
+  (positive `amount`), but income vs. spend handling — likely a `kind`
+  dimension or a set of categories (Income, Transfer) — is undesigned.
 - Credit card exports use a different schema than checking, including a
-  category column Chase supplies itself. Handle separately.
+  category column Chase supplies itself. Handle separately; the header check
+  rejects them today.
 - Amounts appear unformatted in places (`-1` rather than `-1.00`).
   Harmless for float parsing, relevant for display.
 
 ## Repo hygiene
 
-`.gitignore` must contain `*.csv`, `data/`, and `.streamlit/secrets.toml`
-before the first commit.
+`.gitignore` contains `*.csv`, `data/`, and `.streamlit/secrets.toml`. Two
+config CSVs are committed via explicit `!` exceptions: the invented test
+fixture (`tests/sample_transactions.csv`) and — pending the pass-two rework —
+`merchant_aliases.csv`, which the enrichment layer will supersede.
