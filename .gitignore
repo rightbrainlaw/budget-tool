@@ -1,6 +1,7 @@
 *.csv
 data/
 .streamlit/secrets.toml
+.streamlit/.auth_store.json
 .claude/settings.local.json
 
 # Python
