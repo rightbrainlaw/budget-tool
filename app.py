@@ -106,38 +106,49 @@ def current_user():
 user = current_user()
 
 
-def access_token():
-    """The signed-in user's access token, so DB calls carry it and RLS can see
-    auth.uid(). Try the client first; fall back to the session file, because
-    supabase-py doesn't always populate the in-memory session when it's restored
-    from storage in a fresh process."""
+def stored_tokens():
+    """(access, refresh) from the client session, falling back to the session
+    file, because supabase-py doesn't always populate the in-memory session when
+    it's restored from storage in a fresh process."""
     try:
         sess = supabase.auth.get_session()
         if sess and getattr(sess, "access_token", None):
-            return sess.access_token
+            return sess.access_token, getattr(sess, "refresh_token", None)
     except Exception:
         pass
     try:
         with open(AUTH_STORE) as f:
             data = json.load(f)
         for value in data.values():
-            obj = value
-            if isinstance(value, str):
-                try:
-                    obj = json.loads(value)
-                except Exception:
-                    continue
+            try:
+                obj = json.loads(value) if isinstance(value, str) else value
+            except Exception:
+                continue
             if isinstance(obj, dict) and obj.get("access_token"):
-                return obj["access_token"]
+                return obj.get("access_token"), obj.get("refresh_token")
     except Exception:
         pass
-    return None
+    return None, None
 
 
 # Make DB queries run *as* the signed-in user (so RLS sees auth.uid()).
-token = access_token()
-if token:
-    supabase.postgrest.auth(token)
+access, refresh = stored_tokens()
+if access and refresh:
+    try:
+        supabase.auth.set_session(access, refresh)
+    except Exception:
+        pass
+if access:
+    supabase.postgrest.auth(access)
+
+with st.expander("🔧 debug (temporary)"):
+    st.write("Access token found:", bool(access), "· length:", len(access or ""))
+    try:
+        prof = supabase.table("profile").select("id").execute().data
+        st.write("Profile rows visible (1 = DB recognizes you, 0 = not):", len(prof))
+    except Exception as e:
+        st.write("Profile query error:", repr(e))
+    st.write("user.id:", getattr(user, "id", None))
 
 # --- 3. Render --------------------------------------------------------------
 st.title("💰 Mint for James")
