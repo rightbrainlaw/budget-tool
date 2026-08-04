@@ -105,13 +105,39 @@ def current_user():
 
 user = current_user()
 
-# Make sure DB queries run *as* the signed-in user (so RLS sees auth.uid()).
-try:
-    session = supabase.auth.get_session()
-    if session:
-        supabase.postgrest.auth(session.access_token)
-except Exception:
-    pass
+
+def access_token():
+    """The signed-in user's access token, so DB calls carry it and RLS can see
+    auth.uid(). Try the client first; fall back to the session file, because
+    supabase-py doesn't always populate the in-memory session when it's restored
+    from storage in a fresh process."""
+    try:
+        sess = supabase.auth.get_session()
+        if sess and getattr(sess, "access_token", None):
+            return sess.access_token
+    except Exception:
+        pass
+    try:
+        with open(AUTH_STORE) as f:
+            data = json.load(f)
+        for value in data.values():
+            obj = value
+            if isinstance(value, str):
+                try:
+                    obj = json.loads(value)
+                except Exception:
+                    continue
+            if isinstance(obj, dict) and obj.get("access_token"):
+                return obj["access_token"]
+    except Exception:
+        pass
+    return None
+
+
+# Make DB queries run *as* the signed-in user (so RLS sees auth.uid()).
+token = access_token()
+if token:
+    supabase.postgrest.auth(token)
 
 # --- 3. Render --------------------------------------------------------------
 st.title("💰 Mint for James")
@@ -143,7 +169,11 @@ else:
 with st.form("new_budget"):
     bname = st.text_input("Budget name", "Mint for James")
     if st.form_submit_button("Create budget"):
-        supabase.table("budget").insert(
-            {"name": bname, "created_by": user.id}
-        ).execute()
-        st.rerun()
+        try:
+            supabase.table("budget").insert(
+                {"name": bname, "created_by": user.id}
+            ).execute()
+            st.rerun()
+        except Exception as e:
+            st.error("Could not create the budget.")
+            st.exception(e)
