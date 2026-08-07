@@ -15,6 +15,7 @@ many users on a server).
 Run:  streamlit run app.py
 """
 
+import base64
 import json
 import os
 
@@ -141,14 +142,29 @@ if access and refresh:
 if access:
     supabase.postgrest.auth(access)
 
+
+def token_uid(token):
+    """The `sub` (user id) claim inside the JWT access token -- exactly what the
+    database sees as auth.uid(), so it's the safest id to write as created_by."""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload)).get("sub")
+    except Exception:
+        return None
+
+
+auth_uid = token_uid(access) if access else None
+
 with st.expander("🔧 debug (temporary)"):
     st.write("Access token found:", bool(access), "· length:", len(access or ""))
+    st.write("auth.uid from token (created_by we'll write):", auth_uid)
+    st.write("user.id (from get_user):", getattr(user, "id", None))
     try:
         prof = supabase.table("profile").select("id").execute().data
-        st.write("Profile rows visible (1 = DB recognizes you, 0 = not):", len(prof))
+        st.write("profile.id (DB's view of auth.uid):", prof[0]["id"] if prof else None)
     except Exception as e:
         st.write("Profile query error:", repr(e))
-    st.write("user.id:", getattr(user, "id", None))
 
 # --- 3. Render --------------------------------------------------------------
 st.title("💰 Mint for James")
@@ -182,7 +198,7 @@ with st.form("new_budget"):
     if st.form_submit_button("Create budget"):
         try:
             supabase.table("budget").insert(
-                {"name": bname, "created_by": user.id}
+                {"name": bname, "created_by": auth_uid or user.id}
             ).execute()
             st.rerun()
         except Exception as e:

@@ -213,7 +213,10 @@ create policy profile_update_self on public.profile for update
 
 -- Budget: members read/update/delete; any authenticated user may create one
 -- (the trigger then adds them as the first member).
-create policy budget_read   on public.budget for select using (is_member(id));
+-- creator OR member can read: the `created_by` half lets someone see the budget
+-- they just inserted during the INSERT...RETURNING, before the membership
+-- trigger has finished making them a member.
+create policy budget_read   on public.budget for select using (is_member(id) or created_by = auth.uid());
 create policy budget_create on public.budget for insert with check (created_by = auth.uid());
 create policy budget_update on public.budget for update using (is_member(id)) with check (is_member(id));
 create policy budget_delete on public.budget for delete using (is_member(id));
