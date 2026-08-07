@@ -156,16 +156,6 @@ def token_uid(token):
 
 auth_uid = token_uid(access) if access else None
 
-with st.expander("🔧 debug (temporary)"):
-    st.write("Access token found:", bool(access), "· length:", len(access or ""))
-    st.write("auth.uid from token (created_by we'll write):", auth_uid)
-    st.write("user.id (from get_user):", getattr(user, "id", None))
-    try:
-        prof = supabase.table("profile").select("id").execute().data
-        st.write("profile.id (DB's view of auth.uid):", prof[0]["id"] if prof else None)
-    except Exception as e:
-        st.write("Profile query error:", repr(e))
-
 # --- 3. Render --------------------------------------------------------------
 st.title("💰 Mint for James")
 
