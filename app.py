@@ -179,7 +179,7 @@ if st.button("Sign out"):
 
 st.divider()
 
-# --- Pick or create a budget ------------------------------------------------
+# --- Which budget? (the chooser + management live at the BOTTOM) ------------
 budgets = supabase.table("budget").select("*").order("created_at").execute().data
 
 if not budgets:
@@ -193,20 +193,12 @@ if not budgets:
             st.rerun()
     st.stop()
 
-budget_id = st.selectbox(
-    "Budget",
-    options=[b["id"] for b in budgets],
-    format_func=lambda bid: next(b["name"] for b in budgets if b["id"] == bid),
-)
-
-with st.expander("＋ New budget"):
-    with st.form("new_budget"):
-        new_name = st.text_input("Name")
-        if st.form_submit_button("Create") and new_name.strip():
-            supabase.table("budget").insert(
-                {"name": new_name.strip(), "created_by": auth_uid or user.id}
-            ).execute()
-            st.rerun()
+budget_ids = [b["id"] for b in budgets]
+if st.session_state.get("budget_id") not in budget_ids:
+    st.session_state["budget_id"] = budget_ids[0]
+budget_id = st.session_state["budget_id"]
+budget_name = next(b["name"] for b in budgets if b["id"] == budget_id)
+st.caption(f"Budget: **{budget_name}**")
 
 # --- Import a Chase CSV -----------------------------------------------------
 st.divider()
@@ -307,61 +299,90 @@ txns = (
 )
 if not txns:
     st.caption("No transactions yet — import a Chase CSV above.")
-    st.stop()
+else:
+    enrich_rows = (
+        supabase.table("enrichment")
+        .select("txn_id,category_id")
+        .eq("budget_id", budget_id)
+        .execute()
+        .data
+    )
+    category_of = {e["txn_id"]: e.get("category_id") for e in enrich_rows}
+    name_by_id = {c["id"]: c["name"] for c in categories}
+    id_by_name = {c["name"]: c["id"] for c in categories}
 
-enrich_rows = (
-    supabase.table("enrichment")
-    .select("txn_id,category_id")
-    .eq("budget_id", budget_id)
-    .execute()
-    .data
-)
-category_of = {e["txn_id"]: e.get("category_id") for e in enrich_rows}
-name_by_id = {c["id"]: c["name"] for c in categories}
-id_by_name = {c["name"]: c["id"] for c in categories}
+    grid = pd.DataFrame(
+        [
+            {
+                "txn_id": t["txn_id"],
+                "date": t["date"],
+                "description": t["description"],
+                "amount": float(t["amount"]),
+                "category": name_by_id.get(category_of.get(t["txn_id"])) or "",
+            }
+            for t in txns
+        ]
+    )
 
-grid = pd.DataFrame(
-    [
-        {
-            "txn_id": t["txn_id"],
-            "date": t["date"],
-            "description": t["description"],
-            "amount": float(t["amount"]),
-            "category": name_by_id.get(category_of.get(t["txn_id"])) or "",
-        }
-        for t in txns
-    ]
-)
+    st.caption(f"{len(grid)} transactions — pick a category on each row, then Save.")
+    edited = st.data_editor(
+        grid,
+        key=f"txn_editor_{budget_id}_{len(grid)}",
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "txn_id": None,
+            "date": st.column_config.TextColumn("Date", disabled=True),
+            "description": st.column_config.TextColumn("Description", disabled=True, width="large"),
+            "amount": st.column_config.NumberColumn("Amount", disabled=True, format="$%.2f"),
+            "category": st.column_config.SelectboxColumn("Category", options=[""] + sorted(id_by_name)),
+        },
+    )
 
-st.caption(f"{len(grid)} transactions — pick a category on each row, then Save.")
-edited = st.data_editor(
-    grid,
-    key=f"txn_editor_{budget_id}_{len(grid)}",
-    hide_index=True,
-    use_container_width=True,
-    column_config={
-        "txn_id": None,
-        "date": st.column_config.TextColumn("Date", disabled=True),
-        "description": st.column_config.TextColumn("Description", disabled=True, width="large"),
-        "amount": st.column_config.NumberColumn("Amount", disabled=True, format="$%.2f"),
-        "category": st.column_config.SelectboxColumn("Category", options=[""] + sorted(id_by_name)),
-    },
-)
+    if st.button("Save categories", type="primary"):
+        changed = 0
+        for i in range(len(grid)):
+            old, new = grid.iloc[i]["category"], edited.iloc[i]["category"]
+            if new != old:
+                supabase.table("enrichment").upsert(
+                    {
+                        "budget_id": budget_id,
+                        "txn_id": grid.iloc[i]["txn_id"],
+                        "category_id": id_by_name.get(new),  # None (blank) -> uncategorized
+                        "updated_by": auth_uid,
+                    },
+                    on_conflict="budget_id,txn_id",
+                ).execute()
+                changed += 1
+        st.success(f"Saved {changed} change(s).")
+        st.rerun()
 
-if st.button("Save categories", type="primary"):
-    changed = 0
-    for i in range(len(grid)):
-        old, new = grid.iloc[i]["category"], edited.iloc[i]["category"]
-        if new != old:
-            supabase.table("enrichment").upsert(
-                {
-                    "budget_id": budget_id,
-                    "txn_id": grid.iloc[i]["txn_id"],
-                    "category_id": id_by_name.get(new),  # None (blank) -> uncategorized
-                    "updated_by": auth_uid,
-                },
-                on_conflict="budget_id,txn_id",
+# --- Budgets: switch / create / delete (kept at the bottom, out of the way) --
+st.divider()
+with st.expander("Budgets — switch, create, or delete"):
+    st.selectbox(
+        "Active budget",
+        options=budget_ids,
+        format_func=lambda bid: next(b["name"] for b in budgets if b["id"] == bid),
+        key="budget_id",
+    )
+
+    st.markdown("**Create a new budget**")
+    with st.form("new_budget"):
+        new_name = st.text_input("Name")
+        if st.form_submit_button("Create") and new_name.strip():
+            supabase.table("budget").insert(
+                {"name": new_name.strip(), "created_by": auth_uid or user.id}
             ).execute()
-            changed += 1
-    st.success(f"Saved {changed} change(s).")
-    st.rerun()
+            st.rerun()
+
+    st.markdown("**Delete this budget**")
+    st.warning(
+        f"Permanently deletes “{budget_name}” and ALL its transactions, "
+        "categories, and members. This cannot be undone."
+    )
+    if st.checkbox(f"Yes, delete “{budget_name}” and everything in it"):
+        if st.button("Delete budget", type="primary"):
+            supabase.table("budget").delete().eq("id", budget_id).execute()
+            st.session_state.pop("budget_id", None)
+            st.rerun()
