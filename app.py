@@ -21,6 +21,8 @@ import os
 
 import streamlit as st
 
+import normalizer
+
 try:
     from supabase import create_client, ClientOptions
 except ImportError:  # older/newer package layouts
@@ -175,22 +177,87 @@ if st.button("Sign out"):
     st.rerun()
 
 st.divider()
-st.subheader("Your budgets")
-budgets = supabase.table("budget").select("*").order("created_at").execute().data
-if budgets:
-    for b in budgets:
-        st.write(f"• {b['name']}")
-else:
-    st.caption("None yet — create your first one below.")
 
-with st.form("new_budget"):
-    bname = st.text_input("Budget name", "Mint for James")
-    if st.form_submit_button("Create budget"):
-        try:
+# --- Pick or create a budget ------------------------------------------------
+budgets = supabase.table("budget").select("*").order("created_at").execute().data
+
+if not budgets:
+    st.subheader("Create your first budget")
+    with st.form("first_budget"):
+        bname = st.text_input("Budget name", "Mint for James")
+        if st.form_submit_button("Create budget"):
             supabase.table("budget").insert(
                 {"name": bname, "created_by": auth_uid or user.id}
             ).execute()
             st.rerun()
-        except Exception as e:
-            st.error("Could not create the budget.")
-            st.exception(e)
+    st.stop()
+
+budget_id = st.selectbox(
+    "Budget",
+    options=[b["id"] for b in budgets],
+    format_func=lambda bid: next(b["name"] for b in budgets if b["id"] == bid),
+)
+
+with st.expander("＋ New budget"):
+    with st.form("new_budget"):
+        new_name = st.text_input("Name")
+        if st.form_submit_button("Create") and new_name.strip():
+            supabase.table("budget").insert(
+                {"name": new_name.strip(), "created_by": auth_uid or user.id}
+            ).execute()
+            st.rerun()
+
+# --- Import a Chase CSV -----------------------------------------------------
+st.divider()
+st.subheader("Import transactions")
+account = st.text_input(
+    "Account name",
+    "chase-checking",
+    help="A label for which account this file is (e.g. 'chase-checking-9266'). "
+    "Used to tell accounts apart and to catch transfers between them.",
+)
+uploaded = st.file_uploader("Chase CSV export", type="csv")
+if uploaded is not None and st.button("Import", type="primary"):
+    try:
+        uploaded.seek(0)
+        df = normalizer.normalize_file(uploaded, account, source_file=uploaded.name)
+        records = [
+            {
+                "budget_id": budget_id,
+                "txn_id": r["txn_id"],
+                "date": r["date"].isoformat(),
+                "posted_date": r["posted_date"].isoformat(),
+                "amount": float(r["amount"]),
+                "description": r["description"],
+                "account": r["account"],
+                "pending": bool(r["pending"]),
+                "source_file": r["source_file"],
+                "imported_by": auth_uid,
+            }
+            for _, r in df.iterrows()
+        ]
+        supabase.table("transaction").upsert(
+            records, on_conflict="budget_id,txn_id"
+        ).execute()
+        st.success(f"Imported {len(records)} transactions from {uploaded.name}.")
+    except Exception as e:
+        st.error("Import failed.")
+        st.exception(e)
+
+# --- Show the ledger --------------------------------------------------------
+st.divider()
+st.subheader("Transactions")
+txns = (
+    supabase.table("transaction")
+    .select("date,amount,description,account,pending")
+    .eq("budget_id", budget_id)
+    .order("date", desc=True)
+    .limit(1000)
+    .execute()
+    .data
+)
+if txns:
+    st.caption(f"{len(txns)} transactions (newest first)")
+    st.dataframe(txns, use_container_width=True, hide_index=True)
+else:
+    st.caption("No transactions yet — import a Chase CSV above.")

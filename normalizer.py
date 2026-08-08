@@ -152,14 +152,19 @@ def make_txn_id(txn_date: date, amount: float, description: str, account: str) -
 # --------------------------------------------------------------------------- #
 # 5. Normalize one file
 # --------------------------------------------------------------------------- #
-def normalize_file(path: str, account: str) -> pd.DataFrame:
+def normalize_file(path, account: str, source_file: str | None = None) -> pd.DataFrame:
     """Read one Chase export and return the fixed ledger schema.
+
+    `path` may be a filesystem path OR an open file/buffer (e.g. a Streamlit
+    upload) -- pandas reads either. When it's a buffer, pass `source_file` so the
+    original filename is recorded.
 
     Order matters: we validate the balance chain while Balance is still in
     hand, then drop it, because a running balance is only meaningful in
     original file order and breaks the moment rows are sorted or deduped.
     """
-    source_file = path.rsplit("/", 1)[-1]
+    if source_file is None:
+        source_file = str(path).rsplit("/", 1)[-1]
     filtered = filter_junk(read_chase_csv(path))
 
     # Assertion 1: something survived the filter.
