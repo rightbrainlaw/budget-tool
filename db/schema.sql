@@ -89,6 +89,7 @@ create table public.category (
   id         uuid primary key default gen_random_uuid(),
   budget_id  uuid not null references public.budget(id) on delete cascade,
   name       text not null,
+  color      text,                          -- hex like '#2E7D32', for report bars
   created_at timestamptz not null default now(),
   unique (budget_id, name)
 );

@@ -19,6 +19,7 @@ import base64
 import json
 import os
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
@@ -205,20 +206,27 @@ st.caption(f"Budget: **{budget_name}**")
 # --- Category data (loaded up here because the transactions grid needs it) --
 categories = (
     supabase.table("category")
-    .select("id,name")
+    .select("id,name,color")
     .eq("budget_id", budget_id)
     .order("name")
     .execute()
     .data
 )
 if not categories:
-    # Seed a starter set the first time. Every one of these is editable/removable.
-    defaults = ["Groceries", "Dining", "Transportation", "Utilities",
-                "Shopping", "Subscriptions", "Income", "Transfer"]
+    # Seed a starter set the first time. Every one is editable/removable/recolorable.
+    seed = [
+        ("Groceries", "#2E7D32"), ("Dining", "#EF6C00"),
+        ("Transportation", "#1565C0"), ("Utilities", "#6A1B9A"),
+        ("Shopping", "#AD1457"), ("Subscriptions", "#00838F"),
+        ("Income", "#00695C"), ("Transfer", "#757575"),
+    ]
     supabase.table("category").insert(
-        [{"budget_id": budget_id, "name": n} for n in defaults]
+        [{"budget_id": budget_id, "name": n, "color": col} for n, col in seed]
     ).execute()
     st.rerun()
+
+DEFAULT_COLOR = "#888888"
+color_by_name = {c["name"]: (c.get("color") or DEFAULT_COLOR) for c in categories}
 
 # --- Transactions & reports (the main view) --------------------------------
 st.divider()
@@ -424,7 +432,27 @@ with tab_reports:
             spend = view[view["amount"] < 0].copy()
             if not spend.empty:
                 spend["spent"] = -spend["amount"]
-                st.bar_chart(spend.groupby("category")["spent"].sum().sort_values(ascending=False))
+                by_spend = (
+                    spend.groupby("category")["spent"].sum()
+                    .sort_values(ascending=False).reset_index()
+                )
+                names = list(by_spend["category"])
+                colors = [color_by_name.get(n, DEFAULT_COLOR) for n in names]
+                chart = (
+                    alt.Chart(by_spend)
+                    .mark_bar()
+                    .encode(
+                        x=alt.X("spent:Q", title="Spent ($)"),
+                        y=alt.Y("category:N", sort=names, title=None),
+                        color=alt.Color(
+                            "category:N",
+                            scale=alt.Scale(domain=names, range=colors),
+                            legend=None,
+                        ),
+                        tooltip=["category", alt.Tooltip("spent:Q", format="$,.2f")],
+                    )
+                )
+                st.altair_chart(chart, use_container_width=True)
 
 # --- Categories (manage) ----------------------------------------------------
 st.divider()
@@ -437,21 +465,30 @@ with st.expander("Manage categories"):
     )
     if add2.button("Add") and new_cat.strip():
         supabase.table("category").insert(
-            {"budget_id": budget_id, "name": new_cat.strip()}
+            {"budget_id": budget_id, "name": new_cat.strip(), "color": DEFAULT_COLOR}
         ).execute()
         st.rerun()
-    st.caption("Edit a name to rename it; 🗑 deletes it (and un-tags its transactions).")
+    st.caption("Edit a name to rename it; pick its color; 🗑 deletes it (and un-tags its transactions).")
     for c in categories:
-        col1, col2 = st.columns([4, 1])
+        col1, col2, col3 = st.columns([5, 1, 1])
         renamed = col1.text_input(
             "name", value=c["name"], key=f"cat_{c['id']}", label_visibility="collapsed"
+        )
+        picked = col2.color_picker(
+            "color", value=c.get("color") or DEFAULT_COLOR,
+            key=f"color_{c['id']}", label_visibility="collapsed",
         )
         if renamed.strip() and renamed != c["name"]:
             supabase.table("category").update(
                 {"name": renamed.strip()}
             ).eq("id", c["id"]).execute()
             st.rerun()
-        if col2.button("🗑", key=f"del_{c['id']}"):
+        if picked != (c.get("color") or DEFAULT_COLOR):
+            supabase.table("category").update(
+                {"color": picked}
+            ).eq("id", c["id"]).execute()
+            st.rerun()
+        if col3.button("🗑", key=f"del_{c['id']}"):
             supabase.table("category").delete().eq("id", c["id"]).execute()
             st.rerun()
 
