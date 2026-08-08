@@ -200,47 +200,7 @@ budget_id = st.session_state["budget_id"]
 budget_name = next(b["name"] for b in budgets if b["id"] == budget_id)
 st.caption(f"Budget: **{budget_name}**")
 
-# --- Import a Chase CSV -----------------------------------------------------
-st.divider()
-st.subheader("Import transactions")
-account = st.text_input(
-    "Account name",
-    "chase-checking",
-    help="A label for which account this file is (e.g. 'chase-checking-9266'). "
-    "Used to tell accounts apart and to catch transfers between them.",
-)
-uploaded = st.file_uploader("Chase CSV export", type="csv")
-if uploaded is not None and st.button("Import", type="primary"):
-    try:
-        uploaded.seek(0)
-        df = normalizer.normalize_file(uploaded, account, source_file=uploaded.name)
-        records = [
-            {
-                "budget_id": budget_id,
-                "txn_id": r["txn_id"],
-                "date": r["date"].isoformat(),
-                "posted_date": r["posted_date"].isoformat(),
-                "amount": float(r["amount"]),
-                "description": r["description"],
-                "account": r["account"],
-                "pending": bool(r["pending"]),
-                "source_file": r["source_file"],
-                "imported_by": auth_uid,
-            }
-            for _, r in df.iterrows()
-        ]
-        supabase.table("transaction").upsert(
-            records, on_conflict="budget_id,txn_id"
-        ).execute()
-        st.success(f"Imported {len(records)} transactions from {uploaded.name}.")
-    except Exception as e:
-        st.error("Import failed.")
-        st.exception(e)
-
-# --- Categories (editable) --------------------------------------------------
-st.divider()
-st.subheader("Categories")
-
+# --- Category data (loaded up here because the transactions grid needs it) --
 categories = (
     supabase.table("category")
     .select("id,name")
@@ -258,33 +218,7 @@ if not categories:
     ).execute()
     st.rerun()
 
-with st.expander("Manage categories"):
-    add1, add2 = st.columns([4, 1])
-    new_cat = add1.text_input(
-        "Add a category", key="new_cat",
-        label_visibility="collapsed", placeholder="New category name",
-    )
-    if add2.button("Add") and new_cat.strip():
-        supabase.table("category").insert(
-            {"budget_id": budget_id, "name": new_cat.strip()}
-        ).execute()
-        st.rerun()
-    st.caption("Edit a name to rename it; 🗑 deletes it (and un-tags its transactions).")
-    for c in categories:
-        col1, col2 = st.columns([4, 1])
-        renamed = col1.text_input(
-            "name", value=c["name"], key=f"cat_{c['id']}", label_visibility="collapsed"
-        )
-        if renamed.strip() and renamed != c["name"]:
-            supabase.table("category").update(
-                {"name": renamed.strip()}
-            ).eq("id", c["id"]).execute()
-            st.rerun()
-        if col2.button("🗑", key=f"del_{c['id']}"):
-            supabase.table("category").delete().eq("id", c["id"]).execute()
-            st.rerun()
-
-# --- Transactions (categorize in place) ------------------------------------
+# --- Transactions (categorize in place) — the main view --------------------
 st.divider()
 st.subheader("Transactions")
 
@@ -298,7 +232,7 @@ txns = (
     .data
 )
 if not txns:
-    st.caption("No transactions yet — import a Chase CSV above.")
+    st.caption("No transactions yet — import a Chase CSV below.")
 else:
     enrich_rows = (
         supabase.table("enrichment")
@@ -356,6 +290,72 @@ else:
                 changed += 1
         st.success(f"Saved {changed} change(s).")
         st.rerun()
+
+# --- Categories (manage) ----------------------------------------------------
+st.divider()
+st.subheader("Categories")
+with st.expander("Manage categories"):
+    add1, add2 = st.columns([4, 1])
+    new_cat = add1.text_input(
+        "Add a category", key="new_cat",
+        label_visibility="collapsed", placeholder="New category name",
+    )
+    if add2.button("Add") and new_cat.strip():
+        supabase.table("category").insert(
+            {"budget_id": budget_id, "name": new_cat.strip()}
+        ).execute()
+        st.rerun()
+    st.caption("Edit a name to rename it; 🗑 deletes it (and un-tags its transactions).")
+    for c in categories:
+        col1, col2 = st.columns([4, 1])
+        renamed = col1.text_input(
+            "name", value=c["name"], key=f"cat_{c['id']}", label_visibility="collapsed"
+        )
+        if renamed.strip() and renamed != c["name"]:
+            supabase.table("category").update(
+                {"name": renamed.strip()}
+            ).eq("id", c["id"]).execute()
+            st.rerun()
+        if col2.button("🗑", key=f"del_{c['id']}"):
+            supabase.table("category").delete().eq("id", c["id"]).execute()
+            st.rerun()
+
+# --- Import a Chase CSV -----------------------------------------------------
+st.divider()
+st.subheader("Import transactions")
+account = st.text_input(
+    "Account name",
+    "chase-checking",
+    help="A label for which account this file is (e.g. 'chase-checking-9266'). "
+    "Used to tell accounts apart and to catch transfers between them.",
+)
+uploaded = st.file_uploader("Chase CSV export", type="csv")
+if uploaded is not None and st.button("Import", type="primary"):
+    try:
+        uploaded.seek(0)
+        df = normalizer.normalize_file(uploaded, account, source_file=uploaded.name)
+        records = [
+            {
+                "budget_id": budget_id,
+                "txn_id": r["txn_id"],
+                "date": r["date"].isoformat(),
+                "posted_date": r["posted_date"].isoformat(),
+                "amount": float(r["amount"]),
+                "description": r["description"],
+                "account": r["account"],
+                "pending": bool(r["pending"]),
+                "source_file": r["source_file"],
+                "imported_by": auth_uid,
+            }
+            for _, r in df.iterrows()
+        ]
+        supabase.table("transaction").upsert(
+            records, on_conflict="budget_id,txn_id"
+        ).execute()
+        st.success(f"Imported {len(records)} transactions from {uploaded.name}.")
+    except Exception as e:
+        st.error("Import failed.")
+        st.exception(e)
 
 # --- Budgets: switch / create / delete (kept at the bottom, out of the way) --
 st.divider()
