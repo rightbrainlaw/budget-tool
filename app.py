@@ -220,78 +220,173 @@ if not categories:
     ).execute()
     st.rerun()
 
-# --- Transactions (categorize in place) — the main view --------------------
+# --- Transactions & reports (the main view) --------------------------------
 st.divider()
-st.subheader("Transactions")
 
 txns = (
     supabase.table("transaction")
     .select("txn_id,date,amount,description,account")
     .eq("budget_id", budget_id)
     .order("date", desc=True)
-    .limit(1000)
+    .limit(2000)
     .execute()
     .data
 )
-if not txns:
-    st.caption("No transactions yet — import a Chase CSV below.")
-else:
-    enrich_rows = (
-        supabase.table("enrichment")
-        .select("txn_id,category_id")
-        .eq("budget_id", budget_id)
-        .execute()
-        .data
-    )
-    category_of = {e["txn_id"]: e.get("category_id") for e in enrich_rows}
-    name_by_id = {c["id"]: c["name"] for c in categories}
-    id_by_name = {c["name"]: c["id"] for c in categories}
+enrich_rows = (
+    supabase.table("enrichment")
+    .select("txn_id,category_id,reviewed")
+    .eq("budget_id", budget_id)
+    .execute()
+    .data
+)
+enr = {e["txn_id"]: e for e in enrich_rows}
+name_by_id = {c["id"]: c["name"] for c in categories}
+id_by_name = {c["name"]: c["id"] for c in categories}
+cat_options = [""] + sorted(id_by_name)
 
-    grid = pd.DataFrame(
-        [
-            {
-                "txn_id": t["txn_id"],
-                "date": t["date"],
-                "description": t["description"],
-                "amount": float(t["amount"]),
-                "category": name_by_id.get(category_of.get(t["txn_id"])) or "",
-            }
-            for t in txns
-        ]
-    )
 
-    st.caption(f"{len(grid)} transactions — pick a category on each row, then Save.")
-    edited = st.data_editor(
-        grid,
-        key=f"txn_editor_{budget_id}_{len(grid)}",
-        hide_index=True,
-        use_container_width=True,
-        column_config={
-            "txn_id": None,
-            "date": st.column_config.TextColumn("Date", disabled=True),
-            "description": st.column_config.TextColumn("Description", disabled=True, width="large"),
-            "amount": st.column_config.NumberColumn("Amount", disabled=True, format="$%.2f"),
-            "category": st.column_config.SelectboxColumn("Category", options=[""] + sorted(id_by_name)),
-        },
-    )
+def cat_name(txn_id):
+    return name_by_id.get(enr.get(txn_id, {}).get("category_id")) or ""
 
-    if st.button("Save categories", type="primary"):
-        changed = 0
-        for i in range(len(grid)):
-            old, new = grid.iloc[i]["category"], edited.iloc[i]["category"]
-            if new != old:
-                supabase.table("enrichment").upsert(
-                    {
-                        "budget_id": budget_id,
-                        "txn_id": grid.iloc[i]["txn_id"],
-                        "category_id": id_by_name.get(new),  # None (blank) -> uncategorized
-                        "updated_by": auth_uid,
-                    },
-                    on_conflict="budget_id,txn_id",
-                ).execute()
-                changed += 1
-        st.success(f"Saved {changed} change(s).")
-        st.rerun()
+
+def is_reviewed(txn_id):
+    return bool(enr.get(txn_id, {}).get("reviewed"))
+
+
+COLS = {
+    "txn_id": None,
+    "date": st.column_config.TextColumn("Date", disabled=True),
+    "description": st.column_config.TextColumn("Description", disabled=True, width="large"),
+    "amount": st.column_config.NumberColumn("Amount", disabled=True, format="$%.2f"),
+    "category": st.column_config.SelectboxColumn("Category", options=cat_options),
+}
+
+review = [t for t in txns if not is_reviewed(t["txn_id"])]
+done = [t for t in txns if is_reviewed(t["txn_id"])]
+
+tab_review, tab_done, tab_reports = st.tabs(
+    [f"🔍 For review ({len(review)})", f"✅ Categorized ({len(done)})", "📊 Reports"]
+)
+
+with tab_review:
+    if not txns:
+        st.caption("No transactions yet — import a Chase CSV below.")
+    elif not review:
+        st.success("All caught up — nothing to review. 🎉")
+    else:
+        st.caption("Pick a category on each row, then Confirm to file it away.")
+        rgrid = pd.DataFrame(
+            [
+                {
+                    "txn_id": t["txn_id"],
+                    "date": t["date"],
+                    "description": t["description"],
+                    "amount": float(t["amount"]),
+                    "category": cat_name(t["txn_id"]),
+                }
+                for t in review
+            ]
+        )
+        redit = st.data_editor(
+            rgrid, key=f"review_{budget_id}_{len(rgrid)}",
+            hide_index=True, use_container_width=True, column_config=COLS,
+        )
+        if st.button("Confirm categorized rows", type="primary", key="confirm_review"):
+            n = 0
+            for i in range(len(rgrid)):
+                newcat = redit.iloc[i]["category"]
+                if newcat:  # only file rows that actually got a category
+                    supabase.table("enrichment").upsert(
+                        {
+                            "budget_id": budget_id,
+                            "txn_id": rgrid.iloc[i]["txn_id"],
+                            "category_id": id_by_name.get(newcat),
+                            "reviewed": True,
+                            "updated_by": auth_uid,
+                        },
+                        on_conflict="budget_id,txn_id",
+                    ).execute()
+                    n += 1
+            st.success(f"Filed {n} transaction(s).")
+            st.rerun()
+
+with tab_done:
+    if not done:
+        st.caption("Nothing categorized yet — confirm some in the For review tab.")
+    else:
+        st.caption("Change a category, or untick Reviewed to send a row back to review.")
+        dgrid = pd.DataFrame(
+            [
+                {
+                    "txn_id": t["txn_id"],
+                    "date": t["date"],
+                    "description": t["description"],
+                    "amount": float(t["amount"]),
+                    "category": cat_name(t["txn_id"]),
+                    "reviewed": True,
+                }
+                for t in done
+            ]
+        )
+        dedit = st.data_editor(
+            dgrid, key=f"done_{budget_id}_{len(dgrid)}",
+            hide_index=True, use_container_width=True,
+            column_config={**COLS, "reviewed": st.column_config.CheckboxColumn("Reviewed")},
+        )
+        if st.button("Save changes", type="primary", key="save_done"):
+            n = 0
+            for i in range(len(dgrid)):
+                oc, nc = dgrid.iloc[i]["category"], dedit.iloc[i]["category"]
+                orv, nrv = dgrid.iloc[i]["reviewed"], dedit.iloc[i]["reviewed"]
+                if oc != nc or orv != nrv:
+                    supabase.table("enrichment").upsert(
+                        {
+                            "budget_id": budget_id,
+                            "txn_id": dgrid.iloc[i]["txn_id"],
+                            "category_id": id_by_name.get(nc),
+                            "reviewed": bool(nrv),
+                            "updated_by": auth_uid,
+                        },
+                        on_conflict="budget_id,txn_id",
+                    ).execute()
+                    n += 1
+            st.success(f"Updated {n} transaction(s).")
+            st.rerun()
+
+with tab_reports:
+    st.caption("Only confirmed (categorized) transactions are counted.")
+    rep_rows = [
+        {"category": cat_name(t["txn_id"]) or "Uncategorized", "amount": float(t["amount"])}
+        for t in done
+    ]
+    if not rep_rows:
+        st.info("Categorize some transactions to see reports.")
+    else:
+        rep = pd.DataFrame(rep_rows)
+        out = -rep.loc[rep["amount"] < 0, "amount"].sum()
+        inc = rep.loc[rep["amount"] > 0, "amount"].sum()
+        m1, m2 = st.columns(2)
+        m1.metric("Money out", f"${out:,.2f}")
+        m2.metric("Money in", f"${inc:,.2f}")
+
+        by_cat = (
+            rep.groupby("category")["amount"]
+            .agg(total="sum", count="count")
+            .reset_index()
+            .sort_values("total")
+        )
+        st.dataframe(
+            by_cat, hide_index=True, use_container_width=True,
+            column_config={
+                "category": "Category",
+                "total": st.column_config.NumberColumn("Total", format="$%.2f"),
+                "count": st.column_config.NumberColumn("#"),
+            },
+        )
+        spend = rep[rep["amount"] < 0].copy()
+        if not spend.empty:
+            spend["spent"] = -spend["amount"]
+            st.bar_chart(spend.groupby("category")["spent"].sum().sort_values(ascending=False))
 
 # --- Categories (manage) ----------------------------------------------------
 st.divider()
