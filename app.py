@@ -243,13 +243,6 @@ if uploaded is not None and st.button("Import", type="primary"):
     except Exception as e:
         st.error("Import failed.")
         st.exception(e)
-        try:
-            uploaded.seek(0)
-            preview = uploaded.read().decode("utf-8", "replace")[:900]
-            st.caption("First 900 characters of the uploaded file (for debugging):")
-            st.code(preview)
-        except Exception:
-            pass
 
 # --- Show the ledger --------------------------------------------------------
 st.divider()
