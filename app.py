@@ -52,16 +52,25 @@ cookies = CookieController()
 
 class CookieStorage:
     def get_item(self, key):
-        return cookies.get(key)
+        try:
+            return cookies.get(key)
+        except Exception:
+            return None
 
     def set_item(self, key, value):
-        cookies.set(
-            key, value, max_age=60 * 60 * 24 * 30,
-            secure=SECURE_COOKIES, same_site="lax",
-        )
+        try:
+            cookies.set(
+                key, value, max_age=60 * 60 * 24 * 30,
+                secure=SECURE_COOKIES, same_site="lax",
+            )
+        except Exception:
+            pass
 
     def remove_item(self, key):
-        cookies.remove(key)
+        try:
+            cookies.remove(key)
+        except Exception:
+            pass
 
 
 def make_client():
