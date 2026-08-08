@@ -356,37 +356,75 @@ with tab_done:
 with tab_reports:
     st.caption("Only confirmed (categorized) transactions are counted.")
     rep_rows = [
-        {"category": cat_name(t["txn_id"]) or "Uncategorized", "amount": float(t["amount"])}
+        {
+            "date": t["date"],
+            "category": cat_name(t["txn_id"]) or "Uncategorized",
+            "amount": float(t["amount"]),
+        }
         for t in done
     ]
     if not rep_rows:
         st.info("Categorize some transactions to see reports.")
     else:
         rep = pd.DataFrame(rep_rows)
-        out = -rep.loc[rep["amount"] < 0, "amount"].sum()
-        inc = rep.loc[rep["amount"] > 0, "amount"].sum()
-        m1, m2 = st.columns(2)
-        m1.metric("Money out", f"${out:,.2f}")
-        m2.metric("Money in", f"${inc:,.2f}")
+        rep["date"] = pd.to_datetime(rep["date"])
 
-        by_cat = (
-            rep.groupby("category")["amount"]
-            .agg(total="sum", count="count")
-            .reset_index()
-            .sort_values("total")
+        # --- period filter ---
+        period = st.radio(
+            "Period", ["Month", "Year", "Custom range", "All time"],
+            horizontal=True, key="rep_period",
         )
-        st.dataframe(
-            by_cat, hide_index=True, use_container_width=True,
-            column_config={
-                "category": "Category",
-                "total": st.column_config.NumberColumn("Total", format="$%.2f"),
-                "count": st.column_config.NumberColumn("#"),
-            },
-        )
-        spend = rep[rep["amount"] < 0].copy()
-        if not spend.empty:
-            spend["spent"] = -spend["amount"]
-            st.bar_chart(spend.groupby("category")["spent"].sum().sort_values(ascending=False))
+        if period == "Month":
+            months = sorted(rep["date"].dt.strftime("%Y-%m").unique(), reverse=True)
+            sel = st.selectbox("Month", months, key="rep_month")
+            mask = rep["date"].dt.strftime("%Y-%m") == sel
+            label = pd.to_datetime(sel + "-01").strftime("%B %Y")
+        elif period == "Year":
+            years = sorted(rep["date"].dt.year.unique(), reverse=True)
+            sel = st.selectbox("Year", years, key="rep_year")
+            mask = rep["date"].dt.year == sel
+            label = str(sel)
+        elif period == "Custom range":
+            lo, hi = rep["date"].min().date(), rep["date"].max().date()
+            c1, c2 = st.columns(2)
+            start = c1.date_input("From", lo, key="rep_start")
+            end = c2.date_input("To", hi, key="rep_end")
+            mask = (rep["date"].dt.date >= start) & (rep["date"].dt.date <= end)
+            label = f"{start:%b %d, %Y} – {end:%b %d, %Y}"
+        else:
+            mask = pd.Series(True, index=rep.index)
+            label = "all time"
+
+        view = rep[mask]
+        st.caption(f"Showing **{label}** — {len(view)} transaction(s)")
+
+        if view.empty:
+            st.info("No confirmed transactions in this period.")
+        else:
+            out = -view.loc[view["amount"] < 0, "amount"].sum()
+            inc = view.loc[view["amount"] > 0, "amount"].sum()
+            m1, m2 = st.columns(2)
+            m1.metric("Money out", f"${out:,.2f}")
+            m2.metric("Money in", f"${inc:,.2f}")
+
+            by_cat = (
+                view.groupby("category")["amount"]
+                .agg(total="sum", count="count")
+                .reset_index()
+                .sort_values("total")
+            )
+            st.dataframe(
+                by_cat, hide_index=True, use_container_width=True,
+                column_config={
+                    "category": "Category",
+                    "total": st.column_config.NumberColumn("Total", format="$%.2f"),
+                    "count": st.column_config.NumberColumn("#"),
+                },
+            )
+            spend = view[view["amount"] < 0].copy()
+            if not spend.empty:
+                spend["spent"] = -spend["amount"]
+                st.bar_chart(spend.groupby("category")["spent"].sum().sort_values(ascending=False))
 
 # --- Categories (manage) ----------------------------------------------------
 st.divider()
