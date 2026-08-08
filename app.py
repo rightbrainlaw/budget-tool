@@ -176,7 +176,17 @@ name = (user.user_metadata or {}).get("full_name") or user.email
 with header_right:
     st.caption(f"Signed in as **{name}**")
     if st.button("Sign out", use_container_width=True):
-        supabase.auth.sign_out()
+        try:
+            supabase.auth.sign_out()
+        except Exception:
+            pass
+        # Fully reset the dev session: clear the shared file AND the cached
+        # client's in-memory session, so switching accounts starts clean.
+        try:
+            os.remove(AUTH_STORE)
+        except FileNotFoundError:
+            pass
+        get_client.clear()
         st.query_params.clear()
         st.rerun()
 
