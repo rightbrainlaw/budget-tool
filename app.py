@@ -558,3 +558,65 @@ with st.expander("Budgets — switch, create, or delete"):
             supabase.table("budget").delete().eq("id", budget_id).execute()
             st.session_state.pop("budget_id", None)
             st.rerun()
+
+# --- Members: who can access this budget ------------------------------------
+st.divider()
+with st.expander("Members — who can access this budget"):
+    members = (
+        supabase.table("budget_member")
+        .select("user_id,added_at")
+        .eq("budget_id", budget_id)
+        .execute()
+        .data
+    )
+    member_ids = [m["user_id"] for m in members]
+    profs = (
+        supabase.table("profile")
+        .select("id,email,display_name")
+        .in_("id", member_ids)
+        .execute()
+        .data
+        if member_ids
+        else []
+    )
+    prof_by_id = {p["id"]: p for p in profs}
+
+    st.markdown("**Current members**")
+    for m in members:
+        p = prof_by_id.get(m["user_id"], {})
+        label = p.get("display_name") or p.get("email") or m["user_id"]
+        is_me = m["user_id"] == auth_uid
+        c1, c2 = st.columns([4, 1])
+        c1.write(label + ("  *(you)*" if is_me else ""))
+        if not is_me and c2.button("Remove", key=f"rm_{m['user_id']}"):
+            supabase.table("budget_member").delete().eq("budget_id", budget_id).eq(
+                "user_id", m["user_id"]
+            ).execute()
+            st.rerun()
+
+    st.markdown("**Add a member by email**")
+    st.caption("They must have signed into the app at least once first (so an account exists).")
+    a1, a2 = st.columns([4, 1])
+    invite_email = a1.text_input(
+        "email", key="invite_email",
+        label_visibility="collapsed", placeholder="person@example.com",
+    )
+    if a2.button("Add") and invite_email.strip():
+        try:
+            res = supabase.rpc(
+                "add_member_by_email",
+                {"p_budget_id": budget_id, "p_email": invite_email.strip()},
+            ).execute()
+            status = res.data
+            if status == "ok":
+                st.success("Member added.")
+                st.rerun()
+            elif status == "user_not_found":
+                st.warning("No account with that email yet — have them sign in once, then try again.")
+            elif status == "not_authorized":
+                st.error("You don't have permission to add members to this budget.")
+            else:
+                st.error(f"Unexpected result: {status}")
+        except Exception as e:
+            st.error("Couldn't add member — is the add_member_by_email function installed in the database?")
+            st.exception(e)

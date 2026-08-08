@@ -82,6 +82,37 @@ create trigger budget_creator_membership
   after insert on public.budget
   for each row execute function public.add_creator_as_member();
 
+-- Add a member by email. SECURITY DEFINER so it can look users up by email
+-- (RLS otherwise hides non-members) and insert the membership -- but only after
+-- checking the caller is themselves a member of the budget. The invitee must
+-- have signed in at least once (so a profile row exists). Returns 'ok' |
+-- 'not_authorized' | 'user_not_found'.
+create function public.add_member_by_email(p_budget_id uuid, p_email text)
+returns text language plpgsql security definer set search_path = public as $$
+declare
+  v_uid uuid;
+begin
+  if not exists (
+    select 1 from public.budget_member
+    where budget_id = p_budget_id and user_id = auth.uid()
+  ) then
+    return 'not_authorized';
+  end if;
+
+  select id into v_uid from public.profile
+  where lower(email) = lower(trim(p_email)) limit 1;
+  if v_uid is null then
+    return 'user_not_found';
+  end if;
+
+  insert into public.budget_member (budget_id, user_id, added_by)
+  values (p_budget_id, v_uid, auth.uid())
+  on conflict (budget_id, user_id) do nothing;
+  return 'ok';
+end; $$;
+
+grant execute on function public.add_member_by_email(uuid, text) to authenticated;
+
 -- ===========================================================================
 -- Enrichment vocab: saveable categories and merchants (budget-scoped)
 -- ===========================================================================
