@@ -160,7 +160,8 @@ def token_uid(token):
 auth_uid = token_uid(access) if access else None
 
 # --- 3. Render --------------------------------------------------------------
-st.title("💰 Mint for James")
+header_left, header_right = st.columns([3, 1])
+header_left.title("💰 Mint for James")
 
 if not user:
     st.write("Sign in to see your budget.")
@@ -171,11 +172,12 @@ if not user:
     st.stop()
 
 name = (user.user_metadata or {}).get("full_name") or user.email
-st.success(f"Signed in as {name}")
-if st.button("Sign out"):
-    supabase.auth.sign_out()
-    st.query_params.clear()
-    st.rerun()
+with header_right:
+    st.caption(f"Signed in as **{name}**")
+    if st.button("Sign out", use_container_width=True):
+        supabase.auth.sign_out()
+        st.query_params.clear()
+        st.rerun()
 
 st.divider()
 
