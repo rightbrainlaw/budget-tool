@@ -6,22 +6,20 @@ Flow:
   * We exchange that code for a session, so the database now knows who you are.
   * Signed in -> greet by name, show YOUR budgets, let you create one.
 
-Local-dev note: the Supabase session + PKCE verifier are cached in a small
-local JSON file so they survive the redirect out to Google and back. That file
-is git-ignored and dev-only; a deployed version would use browser cookies
-instead (a single shared file is fine for one person on one machine, wrong for
-many users on a server).
+Session note: the Supabase session + PKCE verifier are stored in the visitor's
+own browser cookies (via streamlit-cookies-controller), so each user has an
+independent session -- which is what makes multi-user hosting safe.
 
 Run:  streamlit run app.py
 """
 
 import base64
 import json
-import os
 
 import altair as alt
 import pandas as pd
 import streamlit as st
+from streamlit_cookies_controller import CookieController
 
 import normalizer
 
@@ -33,8 +31,8 @@ except ImportError:  # older/newer package layouts
 
 st.set_page_config(page_title="Mint for James", page_icon="💰")
 
-REDIRECT_URL = "http://localhost:8501"
-AUTH_STORE = ".streamlit/.auth_store.json"
+APP_URL = st.secrets.get("app_url", "http://localhost:8501")
+SECURE_COOKIES = APP_URL.startswith("https")
 
 # --- credentials ------------------------------------------------------------
 try:
@@ -45,48 +43,37 @@ except Exception:
     st.stop()
 
 
-# --- a tiny file-backed storage so the session survives the OAuth redirect ---
-class FileStorage:
-    def __init__(self, path):
-        self.path = path
+# --- per-browser session storage backed by cookies --------------------------
+# Each visitor's Supabase session lives in THEIR OWN browser's cookies, so
+# multiple users never share one session. (A single server-side file would be
+# shared by everyone at once -- that's why the local-file version can't ship.)
+cookies = CookieController()
 
-    def _read(self):
-        if os.path.exists(self.path):
-            try:
-                with open(self.path) as f:
-                    return json.load(f)
-            except Exception:
-                return {}
-        return {}
 
-    def _write(self, data):
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        with open(self.path, "w") as f:
-            json.dump(data, f)
-
+class CookieStorage:
     def get_item(self, key):
-        return self._read().get(key)
+        return cookies.get(key)
 
     def set_item(self, key, value):
-        data = self._read()
-        data[key] = value
-        self._write(data)
+        cookies.set(
+            key, value, max_age=60 * 60 * 24 * 30,
+            secure=SECURE_COOKIES, same_site="lax",
+        )
 
     def remove_item(self, key):
-        data = self._read()
-        data.pop(key, None)
-        self._write(data)
+        cookies.remove(key)
 
 
-@st.cache_resource
-def get_client():
+def make_client():
+    # A fresh client per run (NOT cached globally) so users on the server don't
+    # share one client instance; the cookie storage scopes each to its browser.
     return create_client(
         URL, KEY,
-        options=ClientOptions(flow_type="pkce", storage=FileStorage(AUTH_STORE)),
+        options=ClientOptions(flow_type="pkce", storage=CookieStorage()),
     )
 
 
-supabase = get_client()
+supabase = make_client()
 
 # --- 1. Handle the redirect back from Google (?code=...) ---------------------
 code = st.query_params.get("code")
@@ -112,9 +99,9 @@ user = current_user()
 
 
 def stored_tokens():
-    """(access, refresh) from the client session, falling back to the session
-    file, because supabase-py doesn't always populate the in-memory session when
-    it's restored from storage in a fresh process."""
+    """(access, refresh) from the client session, falling back to scanning the
+    browser cookies, because supabase-py doesn't always populate the in-memory
+    session when it's restored from storage on a fresh run."""
     try:
         sess = supabase.auth.get_session()
         if sess and getattr(sess, "access_token", None):
@@ -122,9 +109,7 @@ def stored_tokens():
     except Exception:
         pass
     try:
-        with open(AUTH_STORE) as f:
-            data = json.load(f)
-        for value in data.values():
+        for value in (cookies.getAll() or {}).values():
             try:
                 obj = json.loads(value) if isinstance(value, str) else value
             except Exception:
@@ -167,7 +152,7 @@ header_left.title("💰 Mint for James")
 if not user:
     st.write("Sign in to see your budget.")
     oauth = supabase.auth.sign_in_with_oauth(
-        {"provider": "google", "options": {"redirect_to": REDIRECT_URL}}
+        {"provider": "google", "options": {"redirect_to": APP_URL}}
     )
     st.link_button("Sign in with Google", oauth.url, type="primary")
     st.stop()
@@ -180,13 +165,12 @@ with header_right:
             supabase.auth.sign_out()
         except Exception:
             pass
-        # Fully reset the dev session: clear the shared file AND the cached
-        # client's in-memory session, so switching accounts starts clean.
+        # Clear this browser's cookies so the session is fully gone.
         try:
-            os.remove(AUTH_STORE)
-        except FileNotFoundError:
+            for cookie_key in list((cookies.getAll() or {}).keys()):
+                cookies.remove(cookie_key)
+        except Exception:
             pass
-        get_client.clear()
         st.query_params.clear()
         st.rerun()
 
