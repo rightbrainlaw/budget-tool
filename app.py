@@ -601,7 +601,7 @@ with st.expander("Members — who can access this budget"):
         "email", key="invite_email",
         label_visibility="collapsed", placeholder="person@example.com",
     )
-    if a2.button("Add") and invite_email.strip():
+    if a2.button("Add", key="add_member") and invite_email.strip():
         try:
             res = supabase.rpc(
                 "add_member_by_email",
