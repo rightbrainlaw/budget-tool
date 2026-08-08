@@ -19,6 +19,7 @@ import base64
 import json
 import os
 
+import pandas as pd
 import streamlit as st
 
 import normalizer
@@ -244,20 +245,123 @@ if uploaded is not None and st.button("Import", type="primary"):
         st.error("Import failed.")
         st.exception(e)
 
-# --- Show the ledger --------------------------------------------------------
+# --- Categories (editable) --------------------------------------------------
+st.divider()
+st.subheader("Categories")
+
+categories = (
+    supabase.table("category")
+    .select("id,name")
+    .eq("budget_id", budget_id)
+    .order("name")
+    .execute()
+    .data
+)
+if not categories:
+    # Seed a starter set the first time. Every one of these is editable/removable.
+    defaults = ["Groceries", "Dining", "Transportation", "Utilities",
+                "Shopping", "Subscriptions", "Income", "Transfer"]
+    supabase.table("category").insert(
+        [{"budget_id": budget_id, "name": n} for n in defaults]
+    ).execute()
+    st.rerun()
+
+with st.expander("Manage categories"):
+    add1, add2 = st.columns([4, 1])
+    new_cat = add1.text_input(
+        "Add a category", key="new_cat",
+        label_visibility="collapsed", placeholder="New category name",
+    )
+    if add2.button("Add") and new_cat.strip():
+        supabase.table("category").insert(
+            {"budget_id": budget_id, "name": new_cat.strip()}
+        ).execute()
+        st.rerun()
+    st.caption("Edit a name to rename it; 🗑 deletes it (and un-tags its transactions).")
+    for c in categories:
+        col1, col2 = st.columns([4, 1])
+        renamed = col1.text_input(
+            "name", value=c["name"], key=f"cat_{c['id']}", label_visibility="collapsed"
+        )
+        if renamed.strip() and renamed != c["name"]:
+            supabase.table("category").update(
+                {"name": renamed.strip()}
+            ).eq("id", c["id"]).execute()
+            st.rerun()
+        if col2.button("🗑", key=f"del_{c['id']}"):
+            supabase.table("category").delete().eq("id", c["id"]).execute()
+            st.rerun()
+
+# --- Transactions (categorize in place) ------------------------------------
 st.divider()
 st.subheader("Transactions")
+
 txns = (
     supabase.table("transaction")
-    .select("date,amount,description,account,pending")
+    .select("txn_id,date,amount,description,account")
     .eq("budget_id", budget_id)
     .order("date", desc=True)
     .limit(1000)
     .execute()
     .data
 )
-if txns:
-    st.caption(f"{len(txns)} transactions (newest first)")
-    st.dataframe(txns, use_container_width=True, hide_index=True)
-else:
+if not txns:
     st.caption("No transactions yet — import a Chase CSV above.")
+    st.stop()
+
+enrich_rows = (
+    supabase.table("enrichment")
+    .select("txn_id,category_id")
+    .eq("budget_id", budget_id)
+    .execute()
+    .data
+)
+category_of = {e["txn_id"]: e.get("category_id") for e in enrich_rows}
+name_by_id = {c["id"]: c["name"] for c in categories}
+id_by_name = {c["name"]: c["id"] for c in categories}
+
+grid = pd.DataFrame(
+    [
+        {
+            "txn_id": t["txn_id"],
+            "date": t["date"],
+            "description": t["description"],
+            "amount": float(t["amount"]),
+            "category": name_by_id.get(category_of.get(t["txn_id"])) or "",
+        }
+        for t in txns
+    ]
+)
+
+st.caption(f"{len(grid)} transactions — pick a category on each row, then Save.")
+edited = st.data_editor(
+    grid,
+    key=f"txn_editor_{budget_id}_{len(grid)}",
+    hide_index=True,
+    use_container_width=True,
+    column_config={
+        "txn_id": None,
+        "date": st.column_config.TextColumn("Date", disabled=True),
+        "description": st.column_config.TextColumn("Description", disabled=True, width="large"),
+        "amount": st.column_config.NumberColumn("Amount", disabled=True, format="$%.2f"),
+        "category": st.column_config.SelectboxColumn("Category", options=[""] + sorted(id_by_name)),
+    },
+)
+
+if st.button("Save categories", type="primary"):
+    changed = 0
+    for i in range(len(grid)):
+        old, new = grid.iloc[i]["category"], edited.iloc[i]["category"]
+        if new != old:
+            supabase.table("enrichment").upsert(
+                {
+                    "budget_id": budget_id,
+                    "txn_id": grid.iloc[i]["txn_id"],
+                    "category_id": id_by_name.get(new),  # None (blank) -> uncategorized
+                    "updated_by": auth_uid,
+                },
+                on_conflict="budget_id,txn_id",
+            ).execute()
+            changed += 1
+    st.success(f"Saved {changed} change(s).")
+    st.rerun()
