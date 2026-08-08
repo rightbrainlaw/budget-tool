@@ -442,7 +442,7 @@ with tab_reports:
                     alt.Chart(by_spend)
                     .mark_bar()
                     .encode(
-                        x=alt.X("spent:Q", title="Spent ($)"),
+                        x=alt.X("spent:Q", title="Spent ($)", axis=alt.Axis(format="$,.0f")),
                         y=alt.Y("category:N", sort=names, title=None),
                         color=alt.Color(
                             "category:N",
