@@ -4,9 +4,9 @@
 -- data model for the enrichment/app layer described in SPEC-normalizer.md:
 --
 --   * Two people (Dan + son) log in with Google and share a "budget".
---   * EQUAL access: every member of a budget can read and write all of its
---     data. There is no role hierarchy. Accountability comes from audit_log,
---     not from restricting permissions.
+--   * Members share day-to-day access (read/write all the budgeting data). One
+--     role distinction: the 'owner' (creator) can delete the budget and manage
+--     members; 'member's can't. Accountability also comes from audit_log.
 --   * Ledger layer (immutable bank facts) and enrichment layer (user-assigned
 --     merchant/category) are separate tables, joined by (budget_id, txn_id).
 --   * Row-Level Security enforces "you can only touch budgets you belong to"
@@ -51,7 +51,8 @@ create table public.budget (
 create table public.budget_member (
   budget_id uuid not null references public.budget(id) on delete cascade,
   user_id   uuid not null references auth.users(id) on delete cascade,
-  -- role is reserved for a future hierarchy; today every member is equal.
+  -- 'owner' (the creator) or 'member'. Owners can delete the budget and manage
+  -- members; members can do everything else equally.
   role      text not null default 'member',
   added_by  uuid references auth.users(id),
   added_at  timestamptz not null default now(),
@@ -68,13 +69,22 @@ returns boolean language sql security definer stable set search_path = public as
   );
 $$;
 
+-- Owner test (the creator). Used to gate budget deletion and member management.
+create function public.is_owner(b uuid)
+returns boolean language sql security definer stable set search_path = public as $$
+  select exists (
+    select 1 from public.budget_member
+    where budget_id = b and user_id = auth.uid() and role = 'owner'
+  );
+$$;
+
 -- When someone creates a budget, make them its first member automatically
 -- (otherwise RLS would lock the creator out of their own budget).
 create function public.add_creator_as_member()
 returns trigger language plpgsql security definer set search_path = public as $$
 begin
-  insert into public.budget_member (budget_id, user_id, added_by)
-  values (new.id, new.created_by, new.created_by);
+  insert into public.budget_member (budget_id, user_id, role, added_by)
+  values (new.id, new.created_by, 'owner', new.created_by);
   return new;
 end; $$;
 
@@ -84,9 +94,9 @@ create trigger budget_creator_membership
 
 -- Add a member by email. SECURITY DEFINER so it can look users up by email
 -- (RLS otherwise hides non-members) and insert the membership -- but only after
--- checking the caller is themselves a member of the budget. The invitee must
--- have signed in at least once (so a profile row exists). Returns 'ok' |
--- 'not_authorized' | 'user_not_found'.
+-- checking the caller is the budget's OWNER. The invitee must have signed in at
+-- least once (so a profile row exists). Returns 'ok' | 'not_authorized' |
+-- 'user_not_found'.
 create function public.add_member_by_email(p_budget_id uuid, p_email text)
 returns text language plpgsql security definer set search_path = public as $$
 declare
@@ -94,7 +104,7 @@ declare
 begin
   if not exists (
     select 1 from public.budget_member
-    where budget_id = p_budget_id and user_id = auth.uid()
+    where budget_id = p_budget_id and user_id = auth.uid() and role = 'owner'
   ) then
     return 'not_authorized';
   end if;
@@ -251,12 +261,12 @@ create policy profile_update_self on public.profile for update
 create policy budget_read   on public.budget for select using (is_member(id) or created_by = auth.uid());
 create policy budget_create on public.budget for insert with check (created_by = auth.uid());
 create policy budget_update on public.budget for update using (is_member(id)) with check (is_member(id));
-create policy budget_delete on public.budget for delete using (is_member(id));
+create policy budget_delete on public.budget for delete using (is_owner(id));
 
 -- Membership: members can see and manage who else is in their budget (invites).
 create policy bm_read   on public.budget_member for select using (is_member(budget_id));
-create policy bm_insert on public.budget_member for insert with check (is_member(budget_id));
-create policy bm_delete on public.budget_member for delete using (is_member(budget_id));
+create policy bm_insert on public.budget_member for insert with check (is_owner(budget_id));
+create policy bm_delete on public.budget_member for delete using (is_owner(budget_id) and role <> 'owner');
 
 -- Everything else: one "members do anything within their budget" policy each.
 create policy category_all   on public.category    for all using (is_member(budget_id)) with check (is_member(budget_id));

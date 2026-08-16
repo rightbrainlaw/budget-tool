@@ -203,8 +203,12 @@ budget_ids = [b["id"] for b in budgets]
 if st.session_state.get("budget_id") not in budget_ids:
     st.session_state["budget_id"] = budget_ids[0]
 budget_id = st.session_state["budget_id"]
-budget_name = next(b["name"] for b in budgets if b["id"] == budget_id)
-st.caption(f"Budget: **{budget_name}**")
+budget_row = next(b for b in budgets if b["id"] == budget_id)
+budget_name = budget_row["name"]
+# The creator of a budget is its owner; only the owner can delete it or manage
+# members. (RLS enforces this too -- this flag just controls what the UI shows.)
+is_owner = budget_row.get("created_by") == auth_uid
+st.caption(f"Budget: **{budget_name}**" + ("  ·  _owner_" if is_owner else "  ·  _member_"))
 
 # --- Category data (loaded up here because the transactions grid needs it) --
 categories = (
@@ -551,23 +555,26 @@ with st.expander("Budgets — switch, create, or delete"):
             ).execute()
             st.rerun()
 
-    st.markdown("**Delete this budget**")
-    st.warning(
-        f"Permanently deletes “{budget_name}” and ALL its transactions, "
-        "categories, and members. This cannot be undone."
-    )
-    if st.checkbox(f"Yes, delete “{budget_name}” and everything in it"):
-        if st.button("Delete budget", type="primary"):
-            supabase.table("budget").delete().eq("id", budget_id).execute()
-            st.session_state.pop("budget_id", None)
-            st.rerun()
+    if is_owner:
+        st.markdown("**Delete this budget**")
+        st.warning(
+            f"Permanently deletes “{budget_name}” and ALL its transactions, "
+            "categories, and members. This cannot be undone."
+        )
+        if st.checkbox(f"Yes, delete “{budget_name}” and everything in it"):
+            if st.button("Delete budget", type="primary"):
+                supabase.table("budget").delete().eq("id", budget_id).execute()
+                st.session_state.pop("budget_id", None)
+                st.rerun()
+    else:
+        st.caption("Only the budget's owner can delete it.")
 
 # --- Members: who can access this budget ------------------------------------
 st.divider()
 with st.expander("Members — who can access this budget"):
     members = (
         supabase.table("budget_member")
-        .select("user_id,added_at")
+        .select("user_id,role,added_at")
         .eq("budget_id", budget_id)
         .execute()
         .data
@@ -588,38 +595,43 @@ with st.expander("Members — who can access this budget"):
     for m in members:
         p = prof_by_id.get(m["user_id"], {})
         label = p.get("display_name") or p.get("email") or m["user_id"]
-        is_me = m["user_id"] == auth_uid
+        role = m.get("role") or "member"
+        tags = (["you"] if m["user_id"] == auth_uid else []) + [role]
         c1, c2 = st.columns([4, 1])
-        c1.write(label + ("  *(you)*" if is_me else ""))
-        if not is_me and c2.button("Remove", key=f"rm_{m['user_id']}"):
+        c1.write(f"{label}  ·  _{', '.join(tags)}_")
+        # Owner-only removal, and the owner can never be removed.
+        if is_owner and role != "owner" and c2.button("Remove", key=f"rm_{m['user_id']}"):
             supabase.table("budget_member").delete().eq("budget_id", budget_id).eq(
                 "user_id", m["user_id"]
             ).execute()
             st.rerun()
 
-    st.markdown("**Add a member by email**")
-    st.caption("They must have signed into the app at least once first (so an account exists).")
-    a1, a2 = st.columns([4, 1])
-    invite_email = a1.text_input(
-        "email", key="invite_email",
-        label_visibility="collapsed", placeholder="person@example.com",
-    )
-    if a2.button("Add", key="add_member") and invite_email.strip():
-        try:
-            res = supabase.rpc(
-                "add_member_by_email",
-                {"p_budget_id": budget_id, "p_email": invite_email.strip()},
-            ).execute()
-            status = res.data
-            if status == "ok":
-                st.success("Member added.")
-                st.rerun()
-            elif status == "user_not_found":
-                st.warning("No account with that email yet — have them sign in once, then try again.")
-            elif status == "not_authorized":
-                st.error("You don't have permission to add members to this budget.")
-            else:
-                st.error(f"Unexpected result: {status}")
-        except Exception as e:
-            st.error("Couldn't add member — is the add_member_by_email function installed in the database?")
-            st.exception(e)
+    if is_owner:
+        st.markdown("**Add a member by email**")
+        st.caption("They must have signed into the app at least once first (so an account exists).")
+        a1, a2 = st.columns([4, 1])
+        invite_email = a1.text_input(
+            "email", key="invite_email",
+            label_visibility="collapsed", placeholder="person@example.com",
+        )
+        if a2.button("Add", key="add_member") and invite_email.strip():
+            try:
+                res = supabase.rpc(
+                    "add_member_by_email",
+                    {"p_budget_id": budget_id, "p_email": invite_email.strip()},
+                ).execute()
+                status = res.data
+                if status == "ok":
+                    st.success("Member added.")
+                    st.rerun()
+                elif status == "user_not_found":
+                    st.warning("No account with that email yet — have them sign in once, then try again.")
+                elif status == "not_authorized":
+                    st.error("You don't have permission to add members to this budget.")
+                else:
+                    st.error(f"Unexpected result: {status}")
+            except Exception as e:
+                st.error("Couldn't add member — is the add_member_by_email function installed in the database?")
+                st.exception(e)
+    else:
+        st.caption("Only the budget's owner can add or remove members.")
