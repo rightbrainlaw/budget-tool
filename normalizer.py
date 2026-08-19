@@ -61,7 +61,13 @@ def read_chase_csv(path: str) -> pd.DataFrame:
     df = pd.read_csv(
         path,
         dtype={"Posting Date": "string", "Balance": "string"},
+        index_col=False,  # some Chase exports put a trailing comma on every data
+                          # line (an extra empty column). Without this, pandas
+                          # treats the first column as an index and shifts every
+                          # field one to the left.
     )
+    # Drop any stray extra column that the trailing comma created.
+    df = df[[c for c in df.columns if c in CHASE_HEADER]]
 
     # Fail early if this isn't the schema we think it is. A credit-card export
     # (different columns) should be rejected here, not silently mangled.
@@ -170,7 +176,12 @@ def normalize_file(path, account: str, source_file: str | None = None) -> pd.Dat
     # Assertion 1: something survived the filter.
     assert len(filtered) > 0, "No transactions left after dropping junk rows"
 
-    posted_date = pd.to_datetime(filtered["Posting Date"], format="%m/%d/%y").dt.date
+    # Chase writes the posting date as M/D/YY on some exports and M/D/YYYY on
+    # others; detect which from a sample rather than guessing per-row.
+    _sample = filtered["Posting Date"].dropna()
+    _year = str(_sample.iloc[0]).strip().split("/")[-1] if len(_sample) else ""
+    _date_fmt = "%m/%d/%Y" if len(_year) == 4 else "%m/%d/%y"
+    posted_date = pd.to_datetime(filtered["Posting Date"], format=_date_fmt).dt.date
     amount = filtered["Amount"].astype(float)
 
     # pending == Balance was blank (NaN or the literal single space). Reduce to
